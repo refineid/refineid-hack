@@ -10,6 +10,13 @@ Connects AI coding agents and service bots to 127.0.0.1:6667 (#refineid):
     - builder  (Build & Verifier Bot: local git status, formatting, cargo/gradle tests)
     - card     (Hardware & Smart Card Monitor: PC/SC reader and token state)
 
+Addressing Rules:
+  - "Hi!", "hello", "who is here" -> all bots reply with presence/greetings.
+  - "all: ...", "bots: ..."       -> broadcast to all bots.
+  - "ag: ...", "muse: ..."        -> direct request to that specific agent only.
+  - "ci: ...", "builder: ...", "card: ..." -> direct request to that service bot only.
+  - "<other_nick>: ..."           -> addressed to someone else, bots remain silent.
+
 Logs all channel messages and events to irc/logs/channel-refineid.log for agents to read.
 """
 
@@ -19,6 +26,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -39,6 +47,31 @@ AGY_BIN = os.environ.get("AGY_BIN", "/Users/pk/.local/bin/agy")
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/Users/pk/src")
 
 ALL_BOT_NICKS = ("ag", "antigravity", "agv", "muse", "ci", "gh", "builder", "build", "check", "card", "pcsc")
+
+BOT_ALIASES = {
+    "ag": ["ag", "antigravity", "agv"],
+    "muse": ["muse"],
+    "ci": ["ci", "gh"],
+    "builder": ["builder", "build", "check"],
+    "card": ["card", "pcsc"],
+}
+
+GREETING_EXACT = {
+    "hi", "hi!", "hello", "hello!", "hey", "hey!", "hei", "hei!",
+    "moro", "moro!", "terve", "terve!", "yo", "yo!", "ping", "ping!"
+}
+GREETING_PREFIXES = (
+    "hi ", "hello ", "hey ", "hei ", "moro ", "terve ", "yo ",
+    "who is here", "who is online"
+)
+
+GREETING_DELAYS = {
+    "ag": 0.0,
+    "muse": 0.3,
+    "ci": 0.6,
+    "builder": 0.9,
+    "card": 1.2,
+}
 
 
 def ensure_log_dir():
@@ -93,6 +126,47 @@ def get_recent_chat_context(limit=20):
         return "".join(lines[-limit:]).strip()
     except Exception:
         return ""
+
+
+def parse_addressing(text):
+    """
+    Determines how a message in the channel is addressed.
+    Returns (target, mode, query)
+    - target: \x27ag\x27, \x27muse\x27, \x27ci\x27, \x27builder\x27, \x27card\x27, \x27all\x27, or other nick string, or None
+    - mode: \x27greeting\x27, \x27broadcast\x27, \x27direct\x27, \x27other\x27, \x27unaddressed\x27
+    - query: remaining text for the bot to act upon
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    # 1. Greetings (e.g. "Hi!", "hello everyone")
+    if lower in GREETING_EXACT or any(lower.startswith(p) for p in GREETING_PREFIXES):
+        return ("all", "greeting", stripped)
+
+    # 2. Explicit broadcasts (e.g. "all:", "bots:", "@all")
+    for b in ("all:", "all,", "all ", "bots:", "bots,", "bots ", "@all", "@bots", "everyone:", "everyone,"):
+        if lower.startswith(b):
+            return ("all", "broadcast", stripped[len(b):].strip())
+
+    # 3. Direct bot addressing (e.g. "ag: ...", "muse: ...", "ci prs")
+    for bot, aliases in BOT_ALIASES.items():
+        for a in aliases:
+            for sep in (":", ",", " "):
+                prefix = a + sep
+                if lower.startswith(prefix):
+                    return (bot, "direct", stripped[len(prefix):].strip())
+            at_prefix = "@" + a + " "
+            if lower.startswith(at_prefix):
+                return (bot, "direct", stripped[len(at_prefix):].strip())
+            if lower == a or lower == f"@{a}":
+                return (bot, "direct", "")
+
+    # 4. Other user nick addressing (e.g. "petri: ...") -> addressed to someone else!
+    m = re.match(r"^([a-zA-Z0-9_\-\[\]\]+)[:,]\s*(.*)$", stripped)
+    if m:
+        return (m.group(1).lower(), "other", m.group(2).strip())
+
+    return (None, "unaddressed", stripped)
 
 
 def resolve_repo_name(arg):
@@ -366,7 +440,6 @@ async def handle_builder_query(sender, query):
 
         # 2. Check if repo is Rust (Cargo.toml)
         if os.path.isfile(os.path.join(target_dir, "Cargo.toml")):
-            # cargo fmt check
             proc1 = await asyncio.create_subprocess_exec(
                 "cargo", "fmt", "--check", cwd=target_dir,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -375,7 +448,6 @@ async def handle_builder_query(sender, query):
             if proc1.returncode != 0:
                 return f"{rname}: cargo fmt check FAILED:\n{err1.decode()[:180]}"
 
-            # cargo clippy
             proc2 = await asyncio.create_subprocess_exec(
                 "cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings",
                 cwd=target_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -440,7 +512,6 @@ async def handle_card_query(sender, query):
             "  - Do not publish unsigned or test-signed binaries as production releases."
         )
 
-    # 1. Enumerate PC/SC readers via macOS PCSC.framework
     readers = []
     try:
         pcsc = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/PCSC.framework/PCSC")
@@ -455,7 +526,6 @@ async def handle_card_query(sender, query):
     except Exception as e:
         readers = [f"PCSC error: {e}"]
 
-    # 2. Enumerate smartcards via security list-smartcards
     cards = []
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -478,7 +548,6 @@ async def handle_card_query(sender, query):
         return f"Detected Smart Cards ({len(cards)}):\n  " + "\n  ".join(cards)
 
     else:
-        # Default: status
         lines = ["Smart Card & Hardware Reader Status:"]
         if readers:
             lines.append(f"  PC/SC Readers ({len(readers)}): " + ", ".join(readers))
@@ -497,10 +566,10 @@ async def handle_card_query(sender, query):
 # ----------------------------------------------------------------------
 
 class IrcBot:
-    def __init__(self, nick, realname, triggers=None, handler=None, is_logger=False):
+    def __init__(self, bot_id, nick, realname, handler=None, is_logger=False):
+        self.bot_id = bot_id
         self.nick = nick
         self.realname = realname
-        self.triggers = triggers or [f"{nick}:", f"{nick} "]
         self.custom_handler = handler
         self.is_logger = is_logger
         self.reader = None
@@ -572,14 +641,13 @@ class IrcBot:
                     if sender not in ALL_BOT_NICKS:
                         log_chat(f"<{sender}> {text}")
 
-                # Ignore triggers from our own bots to avoid infinite loops
+                # Ignore triggers from our own bots to avoid loops
                 if sender in ALL_BOT_NICKS:
                     continue
 
-                await self.handle_message(sender, channel, text)
+                await self.handle_channel_message(sender, channel, text)
 
             elif self.is_logger:
-                # Log membership and channel state changes
                 sender = parts[0][1:].split("!", 1)[0] if parts[0].startswith(":") else ""
                 if command == "JOIN" and len(parts) >= 3:
                     chan = parts[2][1:] if parts[2].startswith(":") else parts[2]
@@ -596,26 +664,64 @@ class IrcBot:
                     topic = parts[3][1:] if parts[3].startswith(":") else parts[3]
                     log_chat(f"* {sender} changed topic of {chan} to: {topic}")
 
-    async def handle_message(self, sender, channel, text):
+    async def handle_channel_message(self, sender, channel, text):
         target = channel if channel.startswith("#") else sender
+        addressed_to, mode, query = parse_addressing(text)
 
-        matched = False
-        query = ""
-        lower_text = text.lower()
-        for trig in self.triggers:
-            if lower_text.startswith(trig):
-                query = text[len(trig):].strip()
-                matched = True
-                break
+        # If addressed to someone else (another nick or user), stay silent
+        if mode == "other":
+            return
+        if mode == "unaddressed" and addressed_to is None:
+            return
 
-        if matched:
+        # Case 1: All bots respond (Greetings or Broadcasts)
+        if addressed_to == "all":
+            delay = GREETING_DELAYS.get(self.bot_id, 0.0)
+            await asyncio.sleep(delay)
+
+            if mode == "greeting":
+                if self.bot_id == "ag":
+                    await self.privmsg(target, f"Hi {sender}! Antigravity coding agent online (ask \x27ag: <task>\x27).")
+                elif self.bot_id == "muse":
+                    await self.privmsg(target, f"Hi {sender}! Muse code agent online (ask \x27muse: <task>\x27).")
+                elif self.bot_id == "ci":
+                    await self.privmsg(target, f"Hi {sender}! CI & GitHub bot online (ask \x27ci help\x27).")
+                elif self.bot_id == "builder":
+                    await self.privmsg(target, f"Hi {sender}! Build & verifier bot online (ask \x27builder help\x27).")
+                elif self.bot_id == "card":
+                    await self.privmsg(target, f"Hi {sender}! Smart card monitor online (ask \x27card help\x27).")
+                return
+
+            elif mode == "broadcast":
+                if query.lower() in ("help", "commands"):
+                    if self.bot_id == "ag":
+                        await self.privmsg(target, "ag: AI coding agent for reviews, code changes, and PR debates.")
+                    elif self.bot_id == "muse":
+                        await self.privmsg(target, "muse: Muse code agent for reviews and code changes.")
+                    elif self.bot_id == "ci":
+                        await self.privmsg(target, "ci: GitHub PRs and CI run tracking (type \x27ci help\x27).")
+                    elif self.bot_id == "builder":
+                        await self.privmsg(target, "builder: Local test suites, formatting, and git status (type \x27builder help\x27).")
+                    elif self.bot_id == "card":
+                        await self.privmsg(target, "card: Smart card readers & token monitor (type \x27card help\x27).")
+                    return
+                elif query.lower() in ("status", "st"):
+                    if self.bot_id == "ag":
+                        await self.privmsg(target, "ag: online, idle.")
+                    elif self.bot_id == "muse":
+                        await self.privmsg(target, "muse: online, idle.")
+                    elif self.custom_handler:
+                        reply = await self.custom_handler(sender, "status")
+                        await self.privmsg(target, f"{reply}")
+                    return
+
+        # Case 2: Addressed directly to THIS bot
+        if addressed_to == self.bot_id:
             log_daemon(f"[{self.nick}] Triggered by {sender} in {target}: {query}")
             if self.custom_handler:
-                # Custom service bot handler
                 reply = await self.custom_handler(sender, query)
                 await self.privmsg(target, f"{sender}: {reply}")
             else:
-                # General AI coding agent dispatch (ag or muse)
                 await self.privmsg(target, f"{sender}: Working on it (no limits: {self.nick})...")
                 asyncio.create_task(self.dispatch_agent(sender, target, query))
 
@@ -670,7 +776,6 @@ async def handle_unix_client(reader, writer, bots):
     writer.close()
     await writer.wait_closed()
 
-    # Protocol: BOT_NAME:CHANNEL:MESSAGE
     decoded = data.decode("utf-8", errors="replace").strip()
     if not decoded:
         return
@@ -691,29 +796,24 @@ async def main():
 
     # 1. AI Coding Agents
     ag_bot = IrcBot(
-        "ag", "Google Antigravity Agent",
-        triggers=["ag:", "ag,", "ag ", "@ag ", "antigravity:", "agv:"],
+        bot_id="ag", nick="ag", realname="Google Antigravity Agent",
         is_logger=True
     )
     muse_bot = IrcBot(
-        "muse", "Muse Code Agent",
-        triggers=["muse:", "muse,", "muse ", "@muse "]
+        bot_id="muse", nick="muse", realname="Muse Code Agent"
     )
 
     # 2. Service Bots
     ci_bot = IrcBot(
-        "ci", "ReFineID CI & GitHub Bot",
-        triggers=["ci:", "ci,", "ci ", "@ci ", "gh:", "gh "],
+        bot_id="ci", nick="ci", realname="ReFineID CI & GitHub Bot",
         handler=handle_ci_query
     )
     builder_bot = IrcBot(
-        "builder", "ReFineID Build & Verifier Bot",
-        triggers=["builder:", "builder,", "builder ", "build:", "build ", "check:", "check "],
+        bot_id="builder", nick="builder", realname="ReFineID Build & Verifier Bot",
         handler=handle_builder_query
     )
     card_bot = IrcBot(
-        "card", "ReFineID Smart Card Monitor",
-        triggers=["card:", "card,", "card ", "@card ", "pcsc:", "pcsc "],
+        bot_id="card", nick="card", realname="ReFineID Smart Card Monitor",
         handler=handle_card_query
     )
 
