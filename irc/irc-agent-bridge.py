@@ -24,14 +24,18 @@ import asyncio
 import ctypes
 import argparse
 import datetime
+import fcntl
 import glob
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import ssl
 import sys
 import subprocess
+import time
 
 ENV_NAME = "prod"
 SERVER = "127.0.0.1"
@@ -41,6 +45,7 @@ TLS_SERVER_HOSTNAME = "oc.daemon.fi"
 CHANNELS = ["#refineid"]
 SOCKET_PATH = "/tmp/irc-agent-bridge-prod.sock"
 DAEMON_LOG_FILE = "/tmp/irc-agent-bridge-prod.log"
+LOCK_FILE_OBJ = None
 
 IRC_DIR = os.path.dirname(os.path.abspath(__file__))
 CHAT_LOG_DIR = os.path.join(IRC_DIR, "logs")
@@ -70,6 +75,13 @@ GREETING_PREFIXES = (
     "who is here", "who is online"
 )
 
+AFFIRMATION_EXACT = {
+    "cool", "cool!", "nice", "nice!", "awesome", "awesome!",
+    "great", "great!", "thanks", "thanks!", "thx", "thx!",
+    "good job", "good work", "well done", "kiitos", "kiitos!",
+    "sweet", "sweet!", "perfect", "perfect!", "roger", "roger that"
+}
+
 GREETING_DELAYS = {
     "ag": 0.0,
     "muse": 0.3,
@@ -77,6 +89,9 @@ GREETING_DELAYS = {
     "builder": 0.9,
     "card": 1.2,
 }
+
+LAST_BOT_MESSAGE_TIME = 0.0
+LAST_BOT_MESSAGE_SENDER = ""
 
 
 def ensure_log_dir():
@@ -170,6 +185,12 @@ def parse_addressing(text):
     m = re.match(r"^([a-zA-Z0-9_\-\[\]\]+)[:,]\s*(.*)$", stripped)
     if m:
         return (m.group(1).lower(), "other", m.group(2).strip())
+
+    # 5. Casual affirmations / acknowledgements (e.g. "cool!", "thanks!", "awesome")
+    if lower in AFFIRMATION_EXACT:
+        if time.time() - LAST_BOT_MESSAGE_TIME < 120:
+            target = LAST_BOT_MESSAGE_SENDER if LAST_BOT_MESSAGE_SENDER in BOT_ALIASES else "ag"
+            return (target, "affirmation", stripped)
 
     return (None, "unaddressed", stripped)
 
@@ -601,6 +622,7 @@ async def handle_card_query(sender, query):
 class IrcBot:
     def __init__(self, bot_id, nick, realname, handler=None, is_logger=False):
         self.bot_id = bot_id
+        self.primary_nick = nick
         self.nick = nick
         self.realname = realname
         self.custom_handler = handler
@@ -608,9 +630,17 @@ class IrcBot:
         self.reader = None
         self.writer = None
         self.running = True
+        self.registered = False
+        self.ping_task = None
+        self.reclaim_task = None
+        self.connected_at = 0.0
+        self.last_activity = time.time()
+        self.reconnect_delay = 3.0
 
     async def connect(self):
         while self.running:
+            self.registered = False
+            self.connected_at = 0.0
             try:
                 tls_desc = f" (TLS, SNI={TLS_SERVER_HOSTNAME})" if USE_TLS else ""
                 log_daemon(f"[{self.nick}] Connecting to {SERVER}:{PORT}{tls_desc} [env={ENV_NAME}]...")
@@ -620,21 +650,107 @@ class IrcBot:
                 self.reader, self.writer = await asyncio.open_connection(
                     SERVER, PORT, ssl=ssl_ctx, server_hostname=TLS_SERVER_HOSTNAME if USE_TLS else None
                 )
-                self.send(f"NICK {self.nick}")
-                self.send(f"USER {self.nick} 0 * :{self.realname}")
-                for ch in CHANNELS:
-                    self.send(f"JOIN {ch}")
-                log_daemon(f"[{self.nick}] Connected and joined {CHANNELS}")
+
+                # Enable TCP Keepalive
+                sock = self.writer.get_extra_info('socket')
+                if sock:
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        if hasattr(socket, 'TCP_KEEPIDLE'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                        elif hasattr(socket, 'TCP_KEEPALIVE'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30)
+                        if hasattr(socket, 'TCP_KEEPINTVL'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                        if hasattr(socket, 'TCP_KEEPCNT'):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                    except Exception:
+                        pass
+
+                self.connected_at = time.time()
+                self.last_activity = time.time()
+
+                # Send registration
+                await self.send_raw(f"NICK {self.nick}")
+                await self.send_raw(f"USER {self.nick} 0 * :{self.realname}")
+
+                # Start ping keepalive task
+                self.ping_task = asyncio.create_task(self.keepalive_ping_loop())
+
                 await self.listen_loop()
             except Exception as e:
-                log_daemon(f"[{self.nick}] Connection error: {e}, reconnecting in 3s...")
-                await asyncio.sleep(3)
+                log_daemon(f"[{self.nick}] Connection error: {e}")
+            finally:
+                await self.cleanup()
+
+            if not self.running:
+                break
+
+            uptime = time.time() - self.connected_at if self.connected_at else 0
+            if uptime > 60:
+                self.reconnect_delay = 3.0
+            else:
+                self.reconnect_delay = min(self.reconnect_delay * 1.5, 30.0)
+
+            log_daemon(f"[{self.nick}] Reconnecting in {self.reconnect_delay:.1f}s...")
+            await asyncio.sleep(self.reconnect_delay)
+
+    async def send_raw(self, line):
+        if self.writer and not self.writer.is_closing():
+            try:
+                self.writer.write((line + "\r\n").encode("utf-8"))
+                await asyncio.wait_for(self.writer.drain(), timeout=5.0)
+            except Exception as e:
+                log_daemon(f"[{self.nick}] Error sending line: {e}")
 
     def send(self, line):
         if self.writer and not self.writer.is_closing():
-            self.writer.write((line + "\r\n").encode("utf-8"))
+            try:
+                self.writer.write((line + "\r\n").encode("utf-8"))
+            except Exception:
+                pass
+
+    async def keepalive_ping_loop(self):
+        try:
+            while self.running and self.writer and not self.writer.is_closing():
+                await asyncio.sleep(45)
+                if time.time() - self.last_activity >= 40:
+                    await self.send_raw(f"PING :{SERVER}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log_daemon(f"[{self.nick}] Keepalive ping loop error: {e}")
+
+    async def cleanup(self):
+        if self.ping_task and not self.ping_task.done():
+            self.ping_task.cancel()
+        if self.reclaim_task and not self.reclaim_task.done():
+            self.reclaim_task.cancel()
+        if self.writer:
+            try:
+                if not self.writer.is_closing():
+                    self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
+            self.writer = None
+        self.reader = None
+
+    async def shutdown(self, reason="ReFineID daemon restart"):
+        self.running = False
+        if self.writer and not self.writer.is_closing():
+            try:
+                self.writer.write(f"QUIT :{reason}\r\n".encode("utf-8"))
+                await asyncio.wait_for(self.writer.drain(), timeout=2.0)
+            except Exception:
+                pass
+        await self.cleanup()
 
     async def privmsg(self, target, msg):
+        global LAST_BOT_MESSAGE_TIME, LAST_BOT_MESSAGE_SENDER
+        LAST_BOT_MESSAGE_TIME = time.time()
+        LAST_BOT_MESSAGE_SENDER = self.bot_id
+
         for line in msg.strip().splitlines():
             line = line.strip()
             if not line:
@@ -647,61 +763,119 @@ class IrcBot:
             while len(line.encode("utf-8")) > 400:
                 chunk = line[:350]
                 line = line[350:]
-                self.send(f"PRIVMSG {target} :{chunk}")
+                await self.send_raw(f"PRIVMSG {target} :{chunk}")
                 await asyncio.sleep(0.1)
-            self.send(f"PRIVMSG {target} :{line}")
+            await self.send_raw(f"PRIVMSG {target} :{line}")
             await asyncio.sleep(0.08)
 
     async def listen_loop(self):
-        while self.running:
-            line = await self.reader.readline()
+        while self.running and self.reader:
+            try:
+                line = await self.reader.readline()
+            except Exception as e:
+                log_daemon(f"[{self.nick}] Socket read error: {e}")
+                break
             if not line:
                 log_daemon(f"[{self.nick}] Connection closed by remote")
                 break
+
+            self.last_activity = time.time()
             raw = line.decode("utf-8", errors="replace").strip()
-            if raw.startswith("PING "):
-                token = raw[5:]
-                self.send(f"PONG {token}")
+            if not raw:
                 continue
 
-            parts = raw.split(" ", 3)
+            # Handle PING
+            if raw.startswith("PING "):
+                token = raw[5:]
+                await self.send_raw(f"PONG {token}")
+                continue
+
+            parts = raw.split(" ")
+            if len(parts) >= 2 and parts[1] == "PING":
+                token = parts[2] if len(parts) > 2 else ""
+                await self.send_raw(f"PONG {token}")
+                continue
+
             if len(parts) < 2:
                 continue
 
-            command = parts[1]
+            prefix = parts[0]
+            cmd = parts[1]
 
-            if command == "PRIVMSG" and len(parts) >= 4:
-                sender = parts[0][1:].split("!", 1)[0]
+            # 001 RPL_WELCOME: successfully registered with IRCd
+            if cmd == "001":
+                self.registered = True
+                log_daemon(f"[{self.nick}] Registered with IRCd. Joining {CHANNELS}...")
+                for ch in CHANNELS:
+                    await self.send_raw(f"JOIN {ch}")
+                continue
+
+            # 433 ERR_NICKNAMEINUSE: Nickname is already in use (ghost connection)
+            elif cmd == "433":
+                log_daemon(f"[{self.nick}] Nick '{self.nick}' in use. Using fallback '{self.nick}_'...")
+                self.nick = f"{self.nick}_"
+                await self.send_raw(f"NICK {self.nick}")
+                await self.send_raw(f"USER {self.nick} 0 * :{self.realname}")
+                for ch in CHANNELS:
+                    await self.send_raw(f"JOIN {ch}")
+                if not self.reclaim_task or self.reclaim_task.done():
+                    self.reclaim_task = asyncio.create_task(self.reclaim_nick_loop())
+                continue
+
+            # Nick change acknowledgement
+            elif cmd == "NICK" and len(parts) >= 3:
+                sender = prefix[1:].split("!", 1)[0] if prefix.startswith(":") else ""
+                new_nick = parts[2][1:] if parts[2].startswith(":") else parts[2]
+                if sender == self.nick:
+                    self.nick = new_nick
+                    log_daemon(f"[{self.bot_id}] Nick confirmed changed to: {self.nick}")
+
+            elif cmd == "PRIVMSG" and len(parts) >= 4:
+                sender = prefix[1:].split("!", 1)[0] if prefix.startswith(":") else ""
                 channel = parts[2]
-                text = parts[3][1:] if parts[3].startswith(":") else parts[3]
+                trailing = " ".join(parts[3:])
+                text = trailing[1:] if trailing.startswith(":") else trailing
 
-                # Only the designated logger logs incoming channel chat to prevent duplicates
+                # Only designated logger logs incoming channel chat
                 if self.is_logger and channel.startswith("#"):
                     if sender not in ALL_BOT_NICKS:
                         log_chat(f"<{sender}> {text}")
 
-                # Ignore triggers from our own bots to avoid loops
                 if sender in ALL_BOT_NICKS:
                     continue
 
-                await self.handle_channel_message(sender, channel, text)
+                try:
+                    await self.handle_channel_message(sender, channel, text)
+                except Exception as e:
+                    log_daemon(f"[{self.nick}] Error handling message from {sender}: {e}")
 
             elif self.is_logger:
-                sender = parts[0][1:].split("!", 1)[0] if parts[0].startswith(":") else ""
-                if command == "JOIN" and len(parts) >= 3:
+                sender = prefix[1:].split("!", 1)[0] if prefix.startswith(":") else ""
+                if cmd == "JOIN" and len(parts) >= 3:
                     chan = parts[2][1:] if parts[2].startswith(":") else parts[2]
                     log_chat(f"* {sender} joined {chan}")
-                elif command == "PART" and len(parts) >= 3:
+                elif cmd == "PART" and len(parts) >= 3:
                     chan = parts[2]
-                    reason = parts[3][1:] if len(parts) > 3 and parts[3].startswith(":") else ""
+                    reason = " ".join(parts[3:])[1:] if len(parts) > 3 and parts[3].startswith(":") else ""
                     log_chat(f"* {sender} left {chan}" + (f" ({reason})" if reason else ""))
-                elif command == "QUIT":
-                    reason = parts[2][1:] if len(parts) > 2 and parts[2].startswith(":") else ""
+                elif cmd == "QUIT":
+                    reason = " ".join(parts[2:])[1:] if len(parts) > 2 and parts[2].startswith(":") else ""
                     log_chat(f"* {sender} quit" + (f" ({reason})" if reason else ""))
-                elif command == "TOPIC" and len(parts) >= 4:
+                elif cmd == "TOPIC" and len(parts) >= 4:
                     chan = parts[2]
-                    topic = parts[3][1:] if parts[3].startswith(":") else parts[3]
+                    topic = " ".join(parts[3:])[1:] if parts[3].startswith(":") else " ".join(parts[3:])
                     log_chat(f"* {sender} changed topic of {chan} to: {topic}")
+
+    async def reclaim_nick_loop(self):
+        try:
+            while self.running and self.nick != self.primary_nick:
+                await asyncio.sleep(10)
+                log_daemon(f"[{self.nick}] Attempting to reclaim primary nick '{self.primary_nick}'...")
+                await self.send_raw(f"NICK {self.primary_nick}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log_daemon(f"[{self.nick}] Error in reclaim nick loop: {e}")
 
     async def handle_channel_message(self, sender, channel, text):
         target = channel if channel.startswith("#") else sender
@@ -713,6 +887,21 @@ class IrcBot:
         if mode == "unaddressed" and addressed_to is None:
             return
 
+        # Case 0: Affirmations and casual acknowledgements (e.g. "cool!", "thanks!")
+        if mode == "affirmation":
+            if addressed_to == self.bot_id:
+                if self.bot_id == "ag":
+                    await self.privmsg(target, f"Thanks {sender}! Ready for reviews, builds, and coding tasks (ask 'ag: <task>').")
+                elif self.bot_id == "muse":
+                    await self.privmsg(target, f"Glad to help {sender}! Let me know if you need code review or refactoring.")
+                elif self.bot_id == "ci":
+                    await self.privmsg(target, f"Anytime {sender}! Tracking PRs and CI checks.")
+                elif self.bot_id == "builder":
+                    await self.privmsg(target, f"Ready {sender}! Let me know when you want to run checks or tests.")
+                elif self.bot_id == "card":
+                    await self.privmsg(target, f"Monitoring readers and card tokens 24/7, {sender}!")
+            return
+
         # Case 1: All bots respond (Greetings or Broadcasts)
         if addressed_to == "all":
             delay = GREETING_DELAYS.get(self.bot_id, 0.0)
@@ -720,15 +909,15 @@ class IrcBot:
 
             if mode == "greeting":
                 if self.bot_id == "ag":
-                    await self.privmsg(target, f"Hi {sender}! Antigravity coding agent online (ask \x27ag: <task>\x27).")
+                    await self.privmsg(target, f"Hi {sender}! Antigravity coding agent online (ask 'ag: <task>').")
                 elif self.bot_id == "muse":
-                    await self.privmsg(target, f"Hi {sender}! Muse code agent online (ask \x27muse: <task>\x27).")
+                    await self.privmsg(target, f"Hi {sender}! Muse code agent online (ask 'muse: <task>').")
                 elif self.bot_id == "ci":
-                    await self.privmsg(target, f"Hi {sender}! CI & GitHub bot online (ask \x27ci help\x27).")
+                    await self.privmsg(target, f"Hi {sender}! CI & GitHub bot online (ask 'ci help').")
                 elif self.bot_id == "builder":
-                    await self.privmsg(target, f"Hi {sender}! Build & verifier bot online (ask \x27builder help\x27).")
+                    await self.privmsg(target, f"Hi {sender}! Build & verifier bot online (ask 'builder help').")
                 elif self.bot_id == "card":
-                    await self.privmsg(target, f"Hi {sender}! Smart card monitor online (ask \x27card help\x27).")
+                    await self.privmsg(target, f"Hi {sender}! Smart card monitor online (ask 'card help').")
                 return
 
             elif mode == "broadcast":
@@ -738,11 +927,11 @@ class IrcBot:
                     elif self.bot_id == "muse":
                         await self.privmsg(target, "muse: Muse code agent for reviews and code changes.")
                     elif self.bot_id == "ci":
-                        await self.privmsg(target, "ci: GitHub PRs and CI run tracking (type \x27ci help\x27).")
+                        await self.privmsg(target, "ci: GitHub PRs and CI run tracking (type 'ci help').")
                     elif self.bot_id == "builder":
-                        await self.privmsg(target, "builder: Local test suites, formatting, and git status (type \x27builder help\x27).")
+                        await self.privmsg(target, "builder: Local test suites, formatting, and git status (type 'builder help').")
                     elif self.bot_id == "card":
-                        await self.privmsg(target, "card: Smart card readers & token monitor (type \x27card help\x27).")
+                        await self.privmsg(target, "card: Smart card readers & token monitor (type 'card help').")
                     return
                 elif query.lower() in ("status", "st"):
                     if self.bot_id == "ag":
@@ -756,6 +945,14 @@ class IrcBot:
 
         # Case 2: Addressed directly to THIS bot
         if addressed_to == self.bot_id:
+            # Handle casual positive replies addressed directly (e.g. "ag: cool", "ag: thanks")
+            if query.lower() in AFFIRMATION_EXACT:
+                if self.bot_id == "ag":
+                    await self.privmsg(target, f"Thanks {sender}! Ready for reviews, builds, and coding tasks (ask 'ag: <task>').")
+                else:
+                    await self.privmsg(target, f"Glad to help {sender}!")
+                return
+
             log_daemon(f"[{self.nick}] Triggered by {sender} in {target}: {query}")
             if self.custom_handler:
                 reply = await self.custom_handler(sender, query)
@@ -979,9 +1176,45 @@ def configure_environment():
         CHANNELS = args.channels
 
 
+def acquire_process_lock():
+    global LOCK_FILE_OBJ
+    lock_path = f"/tmp/irc-agent-bridge-{ENV_NAME}.pid"
+    try:
+        f = open(lock_path, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.write(f"{os.getpid()}\n")
+        f.flush()
+        LOCK_FILE_OBJ = f
+        return True
+    except (BlockingIOError, IOError):
+        log_daemon(f"Another instance of irc-agent-bridge ({ENV_NAME}) is already active. Exiting cleanly.")
+        return False
+
+
+def release_process_lock():
+    global LOCK_FILE_OBJ
+    if LOCK_FILE_OBJ:
+        try:
+            fcntl.flock(LOCK_FILE_OBJ, fcntl.LOCK_UN)
+            LOCK_FILE_OBJ.close()
+        except Exception:
+            pass
+        LOCK_FILE_OBJ = None
+        lock_path = f"/tmp/irc-agent-bridge-{ENV_NAME}.pid"
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
+
 async def main():
     configure_environment()
     ensure_log_dir()
+
+    if not acquire_process_lock():
+        sys.exit(0)
+
     if os.path.exists(SOCKET_PATH):
         try:
             os.remove(SOCKET_PATH)
@@ -1049,18 +1282,46 @@ async def main():
     os.chmod(SOCKET_PATH, 0o777)
     log_daemon(f"IRC Agent Bridge running. Socket at {SOCKET_PATH}, Chat log at {CHAT_LOG_FILE}")
 
-    await asyncio.gather(
-        ag_bot.connect(),
-        muse_bot.connect(),
-        ci_bot.connect(),
-        builder_bot.connect(),
-        card_bot.connect(),
-        server.serve_forever()
-    )
+    # Setup signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def on_stop_signal():
+        log_daemon("Termination signal received. Shutting down gracefully...")
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, on_stop_signal)
+        except NotImplementedError:
+            pass
+
+    tasks = [
+        asyncio.create_task(ag_bot.connect()),
+        asyncio.create_task(muse_bot.connect()),
+        asyncio.create_task(ci_bot.connect()),
+        asyncio.create_task(builder_bot.connect()),
+        asyncio.create_task(card_bot.connect()),
+        asyncio.create_task(server.serve_forever()),
+    ]
+
+    try:
+        wait_task = asyncio.create_task(stop_event.wait())
+        await asyncio.wait([wait_task] + tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        log_daemon("Disconnecting IRC bots cleanly...")
+        all_bots = [ag_bot, muse_bot, ci_bot, builder_bot, card_bot]
+        await asyncio.gather(*(b.shutdown("Service restart") for b in all_bots), return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+        release_process_lock()
+        log_daemon("IRC Agent Bridge shutdown complete.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
+    finally:
+        release_process_lock()

@@ -50,11 +50,11 @@ if [[ "$MODE" == "status" ]]; then
   else
     echo "OFFLINE (load: launchctl load ~/Library/LaunchAgents/fi.daemon.oc-irc-tunnel.plist)"
   fi
-  echo -n " [PROD] Agent Bridge (/tmp/irc-agent-bridge-prod.sock): "
-  if [[ -S "/tmp/irc-agent-bridge-prod.sock" ]]; then
-    echo "ACTIVE"
+  echo -n " [PROD] Remote Cloud Daemon on oc.daemon.fi: "
+  if ssh -o ConnectTimeout=2 -o BatchMode=yes oc "systemctl is-active --quiet refineid-irc-ag.service" 2>/dev/null; then
+    echo "ACTIVE (systemd 24/7 permanent)"
   else
-    echo "INACTIVE"
+    echo "INACTIVE (ssh oc 'sudo systemctl start refineid-irc-ag.service')"
   fi
   echo "=================================================================="
   exit 0
@@ -111,13 +111,12 @@ if ! nc -z 127.0.0.1 6697 2>/dev/null; then
   fi
 fi
 
-echo "==> [PROD] Checking production agent bridge daemon..."
-if [[ ! -S "/tmp/irc-agent-bridge-prod.sock" ]] || ! pgrep -f "irc-agent-bridge.py.*--env prod" >/dev/null 2>&1; then
-  echo "==> Starting production agent bridge daemon (TLS to oc.daemon.fi)..."
-  pkill -f "irc-agent-bridge.py.*--env prod" 2>/dev/null || true
-  rm -f "/tmp/irc-agent-bridge-prod.sock"
-  nohup /opt/homebrew/bin/python3 "$BRIDGE_SCRIPT" --env prod >/tmp/irc-agent-bridge-prod.log 2>&1 &
-  sleep 2
+echo "==> [PROD] Verifying permanent cloud daemon on oc.daemon.fi..."
+if ssh -o ConnectTimeout=3 -o BatchMode=yes oc "systemctl is-active --quiet refineid-irc-ag.service" 2>/dev/null; then
+  echo "==> Remote multi-agent daemon is ACTIVE on oc.daemon.fi (PID $(ssh oc 'systemctl show -p MainPID --value refineid-irc-ag.service 2>/dev/null'))."
+else
+  echo "==> Starting remote daemon on oc.daemon.fi via systemctl..."
+  ssh oc "sudo systemctl restart refineid-irc-ag.service"
 fi
 
 echo ""
@@ -128,8 +127,8 @@ echo " Environment: PRODUCTION (oc.daemon.fi)"
 echo " Server     : oc.daemon.fi:6697 (Let's Encrypt TLSv1.3)"
 echo " Local Port : 127.0.0.1:6697 (authenticated tunnel)"
 echo " Channel    : #refineid"
-echo " Socket     : /tmp/irc-agent-bridge-prod.sock"
-echo " Log        : $DIR/logs/channel-refineid-prod.log"
+echo " Daemon     : refineid-irc-ag.service (24/7 systemd on oc.daemon.fi)"
+echo " Server Log : /home/pk/src/refineid-hack/irc/logs/channel-refineid-prod.log"
 echo ""
 echo " Connect to Production:"
 echo "   From Mac    : irssi"
