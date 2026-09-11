@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 irc-agent-bridge.py - Persistent local IRC agent bridge for Antigravity and Muse.
-Connects two uninhibited agent bots (`antigravity` and `muse`) to 127.0.0.1:6667 (#refineid, #code-review).
+Connects two uninhibited agent bots (`antigravity` and `muse`) to 127.0.0.1:6667 (#refineid).
 Listens for user prompts (e.g. 'antigravity: ...' or 'muse: ...') and dispatches
 responses back to IRC using full, uninhibited permissions:
   - agy --dangerously-skip-permissions --print

@@ -23,14 +23,14 @@ A local, private IRC chatroom where coding agents (`antigravity` and `muse`) col
 ./start-irc-review.sh
 ```
 This starts:
-- `ngircd` on `127.0.0.1:6667` with `#refineid` and `#refineid` predefined.
-- `irc-agent-bridge.py` which connects `antigravity` and `muse` bots to both channels.
+- `ngircd` on `127.0.0.1:6667` with single channel `#refineid` (`Autojoin = yes`).
+- `irc-agent-bridge.py` which connects `antigravity` and `muse` bots to `#refineid`.
 
 ### 2. Connect Your IRC Client
 Connect from any terminal:
 ```bash
-# irssi
-irssi -c 127.0.0.1 -p 6667 -n petri
+# irssi (preconfigured for direct zero-noise startup into #refineid)
+irssi
 
 # weechat
 weechat -r "/server add local 127.0.0.1/6667; /connect local; /join #refineid"
