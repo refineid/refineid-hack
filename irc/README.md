@@ -1,19 +1,19 @@
 # ReFineID Multi-Agent IRC Review Chatroom
 
-A local, private IRC chatroom where coding agents (`ag` and `muse`) collaborate and debate code reviews with the maintainer in real-time.
+A local, private IRC chatroom where coding agents (`ag`, `muse`) and specialized service bots (`ci`, `builder`, `card`) collaborate with the maintainer in real-time.
 
 ```
-+-------------------------------------------------------------+
-|               Local IRC Server (ngIRCd :6667)                |
-|                    Channel: #refineid                       |
-+------------------------------+------------------------------+
-                               |
-       +-----------------------+-----------------------+
-       |                       |                       |
-+------v-------+        +------v-------+        +------v-------+
-|  Maintainer  |        |      ag      |        |     muse     |
-| (petri / pk) |        | (Antigravity)|        |  (Muse Code) |
-+--------------+        +--------------+        +--------------+
++-------------------------------------------------------------------------------+
+|                        Local IRC Server (ngIRCd :6667)                        |
+|                              Channel: #refineid                               |
++---------------------------------------+---------------------------------------+
+                                        |
+       +-------------------+------------+------------+-------------------+
+       |                   |                         |                   |
++------v-------+    +------v-------+          +------v-------+    +------v-------+
+|  Maintainer  |    |  AI Agents   |          | Service Bots |    | Hardware     |
+| (petri / pk) |    |  ag / muse   |          |  ci / builder|    |    card      |
++--------------+    +--------------+          +--------------+    +--------------+
 ```
 
 ## Quick Start
@@ -24,7 +24,7 @@ A local, private IRC chatroom where coding agents (`ag` and `muse`) collaborate 
 ```
 This starts:
 - `ngircd` on `127.0.0.1:6667` with single channel `#refineid` (`Autojoin = yes`).
-- `irc-agent-bridge.py` which connects `ag` and `muse` bots to `#refineid`.
+- `irc-agent-bridge.py` connecting AI agents (`ag`, `muse`) and service bots (`ci`, `builder`, `card`) to `#refineid`.
 
 ### 2. Connect Your IRC Client
 Connect from any terminal:
@@ -48,7 +48,29 @@ You can chat with agents directly in `#refineid`:
 
 The bridge routes the message to the corresponding agent runtime (`agy --print` or `muse exec --yolo`) and sends the response back to IRC.
 
-### 2. Persistent Chat Logging & Agent Reading
+### 2. Specialized Service Bots
+The channel includes dedicated service bots that respond instantly to maintenance commands:
+
+- **`ci` (GitHub & CI Bot)**:
+  - `ci prs` or `ci prs <repo>`: List open PRs across `refineid` or in a specific repo
+  - `ci runs [repo]`: Show latest GitHub Actions workflow run statuses
+  - `ci check <pr#> [repo]`: Inspect check run passes/failures for a specific PR
+  - `ci view <pr#> [repo]`: View PR summary, review decision, and branch details
+  - `ci repos`: List all active `refineid` repositories
+
+- **`builder` (Build & Verifier Bot)**:
+  - `builder status`: Quick summary of git branches and uncommitted changes across all local `refineid-*` repos
+  - `builder check [repo]`: Run formatting, clippy, or `./Scripts/verify-commit.sh` on a local repo
+  - `builder test [repo]`: Run test suites on a local repo (`cargo test`, etc.)
+  - `builder diff [repo]`: Show short git diffstat
+
+- **`card` (Hardware & Smart Card Monitor)**:
+  - `card status`: Report connected PC/SC smart card readers and inserted cards
+  - `card readers`: List all enumerated reader hardware
+  - `card atr`: Display Answer-To-Reset metadata for inserted smart cards
+  - `card rules`: Display AGENTS.md hardware verification requirements
+
+### 3. Persistent Chat Logging & Agent Reading
 All chats and events in `#refineid` are logged to:
 - `irc/logs/channel-refineid.log` (and symlinked at `/tmp/irc-channel-refineid.log`).
 
@@ -61,7 +83,7 @@ irc-logs -s "PR"  # Search chat history
 ```
 When an agent is addressed (`ag:` or `muse:`), recent chat context is automatically supplied to the agent.
 
-### 3. Persistent Multi-Turn PR Reviews
+### 4. Persistent Multi-Turn PR Reviews
 When reviewing or proposing pull requests, start an iterative review discussion:
 ```bash
 # Start a review session with Muse
@@ -78,7 +100,7 @@ When reviewing or proposing pull requests, start an iterative review discussion:
 ```
 Every discussion turn is broadcast live to `#refineid` so you can watch the debate unfold and chime in at any point.
 
-### 4. Symmetrical AGV Reviews for Muse
+### 5. Symmetrical AGV Reviews for Muse
 When Muse performs work, it can engage Antigravity in an identical multi-turn discussion:
 ```bash
 ./discuss-with-agv.sh start --pr <NUM>
