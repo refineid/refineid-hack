@@ -1,0 +1,3 @@
+# Compiled from kcdump.swift with:
+#   swiftc -O -o kcdump kcdump.swift -framework Security
+/kcdump
