@@ -1,0 +1,12 @@
+#!/bin/sh
+# Rule #1: no commit trailers (especially Co-authored-by: AI).
+# Canonical copy: ~/src/refineid/githooks/commit-msg
+# Install everywhere: ~/src/refineid/script/install-githooks.sh
+
+msg="$1"
+if grep -qiE '^(Co-authored-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Reported-by):' "$msg"; then
+    echo "commit-msg: RULE — commit trailers forbidden." >&2
+    echo "No Co-authored-by for any AI." >&2
+    echo "Subject + body only. Disable IDE --trailer injection." >&2
+    exit 1
+fi

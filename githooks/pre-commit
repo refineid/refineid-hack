@@ -1,0 +1,67 @@
+#!/bin/sh
+# Pre-commit gate for refineid-hack:
+#   1. Check for Git whitespace errors (trailing whitespace, space-tab conflicts)
+#   2. Reject commits that contain only whitespace churn
+#   3. Validate Shell scripts (sh -n, shellcheck if available)
+#   4. Validate Swift files (swiftc -typecheck)
+#
+# To bypass for a one-off WIP commit:
+#   git commit --no-verify
+
+set -eu
+
+# Determine target commit for diff (HEAD or empty tree for new repo)
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    against=HEAD
+else
+    against=$(git hash-object -t tree /dev/null)
+fi
+
+failed=0
+
+# 1. Reject Git whitespace errors in staged diff (trailing spaces, mixed tab/spaces)
+if ! git diff-index --check --cached "$against" -- >&2; then
+    echo "pre-commit: error: whitespace errors (trailing whitespace / blank lines) found in staged changes." >&2
+    failed=1
+fi
+
+# 2. Reject files whose staged changes are purely whitespace changes
+for file in $(git diff --cached --name-only --diff-filter=M); do
+    [ -f "$file" ] || continue
+    if git diff -w --cached --quiet -- "$file"; then
+        echo "pre-commit: error: '$file' contains only whitespace changes." >&2
+        failed=1
+    fi
+done
+
+# 3. Check staged Shell scripts
+for sh in $(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.sh$' || true); do
+    [ -f "$sh" ] || continue
+    if ! sh -n "$sh"; then
+        echo "pre-commit: error: shell syntax error in '$sh'" >&2
+        failed=1
+    fi
+    if command -v shellcheck >/dev/null 2>&1; then
+        if ! shellcheck "$sh"; then
+            echo "pre-commit: error: shellcheck reported warnings for '$sh'" >&2
+            failed=1
+        fi
+    fi
+done
+
+# 4. Check staged Swift files
+for sw in $(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.swift$' || true); do
+    [ -f "$sw" ] || continue
+    if command -v swiftc >/dev/null 2>&1; then
+        if ! swiftc -typecheck "$sw" -framework Security >/dev/null 2>&1; then
+            echo "pre-commit: error: Swift typecheck failed for '$sw'" >&2
+            failed=1
+        fi
+    fi
+done
+
+if [ "$failed" -ne 0 ]; then
+    echo "" >&2
+    echo "Fix the issues above and re-stage, or bypass with: git commit --no-verify" >&2
+    exit 1
+fi
