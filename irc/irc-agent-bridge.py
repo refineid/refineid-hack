@@ -22,24 +22,29 @@ Logs all channel messages and events to irc/logs/channel-refineid.log for agents
 
 import asyncio
 import ctypes
+import argparse
 import datetime
 import glob
 import json
 import os
 import re
+import shutil
+import ssl
 import sys
 import subprocess
-import shutil
 
+ENV_NAME = "prod"
 SERVER = "127.0.0.1"
-PORT = 6667
+PORT = 6697
+USE_TLS = True
+TLS_SERVER_HOSTNAME = "oc.daemon.fi"
 CHANNELS = ["#refineid"]
-SOCKET_PATH = "/tmp/irc-agent-bridge.sock"
-DAEMON_LOG_FILE = "/tmp/irc-agent-bridge.log"
+SOCKET_PATH = "/tmp/irc-agent-bridge-prod.sock"
+DAEMON_LOG_FILE = "/tmp/irc-agent-bridge-prod.log"
 
 IRC_DIR = os.path.dirname(os.path.abspath(__file__))
 CHAT_LOG_DIR = os.path.join(IRC_DIR, "logs")
-CHAT_LOG_FILE = os.path.join(CHAT_LOG_DIR, "channel-refineid.log")
+CHAT_LOG_FILE = os.path.join(CHAT_LOG_DIR, "channel-refineid-prod.log")
 SYMLINK_LOG_FILE = "/tmp/irc-channel-refineid.log"
 
 MUSE_BIN = os.environ.get("MUSE_BIN", "/Users/pk/.local/bin/muse")
@@ -579,8 +584,14 @@ class IrcBot:
     async def connect(self):
         while self.running:
             try:
-                log_daemon(f"[{self.nick}] Connecting to {SERVER}:{PORT}...")
-                self.reader, self.writer = await asyncio.open_connection(SERVER, PORT)
+                tls_desc = f" (TLS, SNI={TLS_SERVER_HOSTNAME})" if USE_TLS else ""
+                log_daemon(f"[{self.nick}] Connecting to {SERVER}:{PORT}{tls_desc} [env={ENV_NAME}]...")
+                ssl_ctx = None
+                if USE_TLS:
+                    ssl_ctx = ssl.create_default_context()
+                self.reader, self.writer = await asyncio.open_connection(
+                    SERVER, PORT, ssl=ssl_ctx, server_hostname=TLS_SERVER_HOSTNAME if USE_TLS else None
+                )
                 self.send(f"NICK {self.nick}")
                 self.send(f"USER {self.nick} 0 * :{self.realname}")
                 for ch in CHANNELS:
@@ -789,10 +800,77 @@ async def handle_unix_client(reader, writer, bots):
         await target_bot.privmsg(channel, message)
 
 
+def configure_environment():
+    global ENV_NAME, SERVER, PORT, USE_TLS, TLS_SERVER_HOSTNAME, CHANNELS
+    global SOCKET_PATH, DAEMON_LOG_FILE, CHAT_LOG_FILE
+
+    parser = argparse.ArgumentParser(description="ReFineID Multi-Agent IRC Review Bridge")
+    parser.add_argument(
+        "--env",
+        choices=["prod", "test", "local", "oc"],
+        default=os.environ.get("IRC_ENV", "prod"),
+        help="Target environment: 'prod' (oc.daemon.fi, default) or 'test' (local)"
+    )
+    parser.add_argument("--test", action="store_const", const="test", dest="env", help="Shortcut for --env test")
+    parser.add_argument("--prod", action="store_const", const="prod", dest="env", help="Shortcut for --env prod")
+    parser.add_argument("--server", default=None, help="IRC server address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="IRC server port (default: 6697 for prod, 6667 for test)")
+    parser.add_argument("--tls", dest="use_tls", action="store_true", default=None, help="Force TLS encryption")
+    parser.add_argument("--no-tls", dest="use_tls", action="store_false", help="Disable TLS encryption")
+    parser.add_argument("--tls-host", default=os.environ.get("IRC_TLS_HOST", "oc.daemon.fi"), help="TLS SNI hostname")
+    parser.add_argument("--channel", action="append", dest="channels", help="Channel to join (default: #refineid)")
+
+    args, _ = parser.parse_known_args()
+
+    target_env = "test" if args.env in ("test", "local") else "prod"
+    ENV_NAME = target_env
+
+    if ENV_NAME == "prod":
+        SERVER = args.server or os.environ.get("IRC_SERVER", "127.0.0.1")
+        PORT = args.port or int(os.environ.get("IRC_PORT", 6697))
+        USE_TLS = True if args.use_tls is None else args.use_tls
+        TLS_SERVER_HOSTNAME = args.tls_host
+        SOCKET_PATH = "/tmp/irc-agent-bridge-prod.sock"
+        DAEMON_LOG_FILE = "/tmp/irc-agent-bridge-prod.log"
+        CHAT_LOG_FILE = os.path.join(CHAT_LOG_DIR, "channel-refineid-prod.log")
+    else:
+        SERVER = args.server or os.environ.get("IRC_SERVER", "127.0.0.1")
+        PORT = args.port or int(os.environ.get("IRC_PORT", 6667))
+        USE_TLS = False if args.use_tls is None else args.use_tls
+        TLS_SERVER_HOSTNAME = args.tls_host
+        SOCKET_PATH = "/tmp/irc-agent-bridge-test.sock"
+        DAEMON_LOG_FILE = "/tmp/irc-agent-bridge-test.log"
+        CHAT_LOG_FILE = os.path.join(CHAT_LOG_DIR, "channel-refineid-test.log")
+
+    if args.channels:
+        CHANNELS = args.channels
+
+
 async def main():
+    configure_environment()
     ensure_log_dir()
     if os.path.exists(SOCKET_PATH):
-        os.remove(SOCKET_PATH)
+        try:
+            os.remove(SOCKET_PATH)
+        except OSError:
+            pass
+
+    # Maintain canonical socket and log symlinks
+    canonical_sock = "/tmp/irc-agent-bridge.sock"
+    try:
+        if os.path.islink(canonical_sock) or os.path.exists(canonical_sock):
+            os.remove(canonical_sock)
+        os.symlink(SOCKET_PATH, canonical_sock)
+    except OSError:
+        pass
+
+    canonical_log = "/tmp/irc-channel-refineid.log"
+    try:
+        if os.path.islink(canonical_log) or os.path.exists(canonical_log):
+            os.remove(canonical_log)
+        os.symlink(CHAT_LOG_FILE, canonical_log)
+    except OSError:
+        pass
 
     # 1. AI Coding Agents
     ag_bot = IrcBot(

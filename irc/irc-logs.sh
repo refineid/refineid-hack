@@ -3,18 +3,39 @@ set -euo pipefail
 
 # irc-logs.sh - View and search ReFineID IRC channel chat logs (#refineid)
 
-LOG_FILE="/Users/pk/src/refineid-hack/irc/logs/channel-refineid.log"
-ALT_LOG="/tmp/irc-channel-refineid.log"
+LOG_ENV="prod"
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --test|test|-t)
+      LOG_ENV="test"
+      shift
+      ;;
+    --prod|prod)
+      LOG_ENV="prod"
+      shift
+      ;;
+  esac
+fi
+
+LOG_FILE="/Users/pk/src/refineid-hack/irc/logs/channel-refineid-${LOG_ENV}.log"
+ALT_LOG="/Users/pk/src/refineid-hack/irc/logs/channel-refineid.log"
+SYMLINK_LOG="/tmp/irc-channel-refineid.log"
 
 if [[ ! -f "$LOG_FILE" && -f "$ALT_LOG" ]]; then
   LOG_FILE="$ALT_LOG"
+elif [[ ! -f "$LOG_FILE" && -f "$SYMLINK_LOG" ]]; then
+  LOG_FILE="$SYMLINK_LOG"
 fi
 
 usage() {
   cat <<EOF
-Usage: irc-logs [options] [lines]
+Usage: irc-logs [--test | --prod] [options] [lines]
 
 View and search ReFineID IRC chatroom logs (#refineid).
+
+Environments:
+  --prod             View production logs from oc.daemon.fi (default)
+  --test             View local test environment logs
 
 Options:
   -n, --lines <N>    Number of lines to view (default: 50)
@@ -25,10 +46,10 @@ Options:
   -h, --help         Show this help message
 
 Examples:
-  irc-logs           # View last 50 lines
-  irc-logs 20        # View last 20 lines
-  irc-logs -f        # Tail chat in real time
-  irc-logs -s "PR"   # Search for mentions of PR
+  irc-logs           # View last 50 lines of production log
+  irc-logs --test    # View last 50 lines of test log
+  irc-logs -f        # Tail production chat in real time
+  irc-logs --test -f # Tail test chat in real time
 EOF
   exit 0
 }

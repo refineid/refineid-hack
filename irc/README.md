@@ -4,39 +4,50 @@ A local, private IRC chatroom where coding agents (`ag`, `muse`) and specialized
 
 ```
 +-------------------------------------------------------------------------------+
-|                        Local IRC Server (ngIRCd :6667)                        |
-|                              Channel: #refineid                               |
-+---------------------------------------+---------------------------------------+
-                                        |
-       +-------------------+------------+------------+-------------------+
-       |                   |                         |                   |
-+------v-------+    +------v-------+          +------v-------+    +------v-------+
-|  Maintainer  |    |  AI Agents   |          | Service Bots |    | Hardware     |
-| (petri / pk) |    |  ag / muse   |          |  ci / builder|    |    card      |
-+--------------+    +--------------+          +--------------+    +--------------+
+|                       ReFineID Dual-Tier IRC Topology                         |
++-------------------------------------------------------------------------------+
+
+  [PROD] oc.daemon.fi (:6697 TLSv1.3, Let's Encrypt)
+     ^    - Production multi-agent review & team chatroom
+     |    - Always online, systemd-managed ngIRCd
+     |    - Authenticated persistent SSH tunnel (:6697 on Mac)
+     |
+     +---- Connect via: ssh -t oc irssi   OR   irssi (prod chatnet)
+     |
+  [TEST] Local Server (127.0.0.1:6667 ngIRCd)
+     ^    - Isolated local development & bot experimentation
+     |    - Staging new service bots and review scripts
+     |
+     +---- Connect via: irssi (then '/connect test')
 ```
 
 ## Quick Start
 
-### 1. Launch Server & Agent Bridge
+### 1. Launch Environments
+
 ```bash
-./start-irc-review.sh
+# Check status of both environments
+./start-irc-review.sh status
+
+# Start / verify Production environment (default)
+./start-irc-review.sh --prod
+
+# Start / verify Local Test environment
+./start-irc-review.sh --test
 ```
-This starts:
-- `ngircd` on `127.0.0.1:6667` with single channel `#refineid` (`Autojoin = yes`).
-- `irc-agent-bridge.py` connecting AI agents (`ag`, `muse`) and service bots (`ci`, `builder`, `card`) to `#refineid`.
 
 ### 2. Connect Your IRC Client
-Connect from any terminal:
+
 ```bash
-# irssi (preconfigured for direct zero-noise startup into #refineid)
+# Connect to Production (preconfigured default in irssi)
 irssi
 
-# weechat
-weechat -r "/server add local 127.0.0.1/6667; /connect local; /join #refineid"
+# Connect to Production from anywhere via SSH
+ssh -t oc irssi
 
-# netcat (minimalist)
-nc 127.0.0.1 6667
+# Connect to Local Test server
+irssi
+# (inside irssi: /connect test)
 ```
 
 ## How It Works
