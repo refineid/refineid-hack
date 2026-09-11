@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 irc-agent-bridge.py - Persistent local IRC agent bridge for Antigravity and Muse.
-Connects two agent bots (`antigravity` and `muse`) to 127.0.0.1:6667 (#refineid, #code-review).
+Connects two uninhibited agent bots (`antigravity` and `muse`) to 127.0.0.1:6667 (#refineid, #code-review).
 Listens for user prompts (e.g. 'antigravity: ...' or 'muse: ...') and dispatches
-responses back to IRC. Also provides a local UNIX socket to broadcast discussion turns.
+responses back to IRC using full, uninhibited permissions:
+  - agy --dangerously-skip-permissions --print
+  - muse exec --yolo
 """
 
 import asyncio
@@ -16,9 +18,22 @@ SERVER = "127.0.0.1"
 PORT = 6667
 CHANNELS = ["#refineid", "#code-review"]
 SOCKET_PATH = "/tmp/irc-agent-bridge.sock"
+LOG_FILE = "/tmp/irc-agent-bridge.log"
 
 MUSE_BIN = os.environ.get("MUSE_BIN", "/Users/pk/.local/bin/muse")
 AGY_BIN = os.environ.get("AGY_BIN", "/Users/pk/.local/bin/agy")
+WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/Users/pk/src")
+
+
+def log(msg):
+    line = f"[bridge] {msg}\n"
+    sys.stderr.write(line)
+    sys.stderr.flush()
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 class IrcBot:
@@ -32,15 +47,17 @@ class IrcBot:
     async def connect(self):
         while self.running:
             try:
+                log(f"[{self.nick}] Connecting to {SERVER}:{PORT}...")
                 self.reader, self.writer = await asyncio.open_connection(SERVER, PORT)
                 self.send(f"NICK {self.nick}")
                 self.send(f"USER {self.nick} 0 * :{self.realname}")
                 for ch in CHANNELS:
                     self.send(f"JOIN {ch}")
+                log(f"[{self.nick}] Connected and joined {CHANNELS}")
                 await self.listen_loop()
             except Exception as e:
-                print(f"[{self.nick}] Connection error: {e}, reconnecting in 5s...", file=sys.stderr)
-                await asyncio.sleep(5)
+                log(f"[{self.nick}] Connection error: {e}, reconnecting in 3s...")
+                await asyncio.sleep(3)
 
     def send(self, line):
         if self.writer and not self.writer.is_closing():
@@ -56,14 +73,15 @@ class IrcBot:
                 chunk = line[:350]
                 line = line[350:]
                 self.send(f"PRIVMSG {target} :{chunk}")
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
             self.send(f"PRIVMSG {target} :{line}")
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.08)
 
     async def listen_loop(self):
         while self.running:
             line = await self.reader.readline()
             if not line:
+                log(f"[{self.nick}] Connection closed by remote")
                 break
             raw = line.decode("utf-8", errors="replace").strip()
             if raw.startswith("PING "):
@@ -98,37 +116,46 @@ class IrcBot:
             matched = True
 
         if matched and query:
-            await self.privmsg(target, f"{sender}: On it. Thinking...")
+            log(f"[{self.nick}] Received query from {sender} in {target}: {query}")
+            await self.privmsg(target, f"{sender}: Working on it (no limits: {self.nick})...")
             asyncio.create_task(self.dispatch_agent(sender, target, query))
 
     async def dispatch_agent(self, sender, target, query):
-        loop = asyncio.get_running_loop()
         try:
             if self.nick == "muse":
-                proc = await asyncio.create_subprocess_exec(
-                    MUSE_BIN, "exec", "--yolo", query,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, _ = await proc.communicate()
-                out_text = stdout.decode("utf-8", errors="replace")
-                # Remove runtime banner lines
+                # muse exec --yolo
+                cmd = [MUSE_BIN, "exec", "--yolo", query]
+            else:
+                # agy --dangerously-skip-permissions --print
+                cmd = [AGY_BIN, "--dangerously-skip-permissions", "--print", query]
+
+            log(f"[{self.nick}] Executing: {' '.join(cmd)}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=WORKSPACE_DIR
+            )
+            stdout, stderr = await proc.communicate()
+            out_text = stdout.decode("utf-8", errors="replace")
+            err_text = stderr.decode("utf-8", errors="replace")
+
+            if self.nick == "muse":
                 lines = [l for l in out_text.splitlines() if not l.startswith("muse: workspace")]
                 reply = "\n".join(lines).strip()
             else:
-                proc = await asyncio.create_subprocess_exec(
-                    AGY_BIN, "--dangerously-skip-permissions", "--print", query,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, _ = await proc.communicate()
-                reply = stdout.decode("utf-8", errors="replace").strip()
+                reply = out_text.strip()
 
-            if not reply:
-                reply = "(no output produced)"
+            if not reply and err_text:
+                reply = f"stderr: {err_text.strip()}"
+            elif not reply:
+                reply = "(done, no output)"
+
+            log(f"[{self.nick}] Finished query for {sender}, reply length: {len(reply)} chars")
             await self.privmsg(target, f"{sender}: {reply}")
         except Exception as e:
-            await self.privmsg(target, f"{sender}: Error executing agent query: {e}")
+            log(f"[{self.nick}] Error executing agent query: {e}")
+            await self.privmsg(target, f"{sender}: Error executing agent: {e}")
 
 
 async def handle_unix_client(reader, writer, bots):
@@ -146,6 +173,7 @@ async def handle_unix_client(reader, writer, bots):
     bot_name, channel, message = parts[0].strip().lower(), parts[1].strip(), parts[2]
     target_bot = bots.get(bot_name)
     if target_bot:
+        log(f"[socket] Relaying message from {bot_name} to {channel}")
         await target_bot.privmsg(channel, message)
 
 
@@ -162,7 +190,7 @@ async def main():
         SOCKET_PATH
     )
     os.chmod(SOCKET_PATH, 0o777)
-    print(f"IRC Agent Bridge running. Socket at {SOCKET_PATH}", file=sys.stderr)
+    log(f"IRC Agent Bridge running. Socket at {SOCKET_PATH}")
 
     await asyncio.gather(
         agv_bot.connect(),
