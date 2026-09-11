@@ -3,7 +3,7 @@ set -euo pipefail
 
 # irc-send.sh - Send a message to local IRC as antigravity or muse
 BOT="${1:-antigravity}"
-CHANNEL="${2:-#code-review}"
+CHANNEL="${2:-#refineid}"
 shift 2 || true
 MESSAGE="$*"
 

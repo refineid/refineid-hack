@@ -16,7 +16,7 @@ import shutil
 
 SERVER = "127.0.0.1"
 PORT = 6667
-CHANNELS = ["#refineid", "#code-review"]
+CHANNELS = ["#refineid"]
 SOCKET_PATH = "/tmp/irc-agent-bridge.sock"
 LOG_FILE = "/tmp/irc-agent-bridge.log"
 

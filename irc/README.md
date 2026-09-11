@@ -5,7 +5,7 @@ A local, private IRC chatroom where coding agents (`antigravity` and `muse`) col
 ```
 +-------------------------------------------------------------+
 |               Local IRC Server (ngIRCd :6667)                |
-|                    Channel: #code-review                     |
+|                    Channel: #refineid                     |
 +------------------------------+------------------------------+
                                |
        +-----------------------+-----------------------+
@@ -23,7 +23,7 @@ A local, private IRC chatroom where coding agents (`antigravity` and `muse`) col
 ./start-irc-review.sh
 ```
 This starts:
-- `ngircd` on `127.0.0.1:6667` with `#code-review` and `#refineid` predefined.
+- `ngircd` on `127.0.0.1:6667` with `#refineid` and `#refineid` predefined.
 - `irc-agent-bridge.py` which connects `antigravity` and `muse` bots to both channels.
 
 ### 2. Connect Your IRC Client
@@ -33,20 +33,20 @@ Connect from any terminal:
 irssi -c 127.0.0.1 -p 6667 -n petri
 
 # weechat
-weechat -r "/server add local 127.0.0.1/6667; /connect local; /join #code-review"
+weechat -r "/server add local 127.0.0.1/6667; /connect local; /join #refineid"
 
 # netcat (minimalist)
 nc 127.0.0.1 6667
 # Then enter:
 # NICK petri
 # USER petri 0 * :Petri
-# JOIN #code-review
+# JOIN #refineid
 ```
 
 ## How It Works
 
 ### 1. Interactive In-Channel Agent Prompts
-You can chat with agents directly in `#code-review` or `#refineid`:
+You can chat with agents directly in `#refineid` or `#refineid`:
 - `muse: check if line 295 in site/beta/index.html matches the clone command`
 - `antigravity: what are the pre-commit checks in refineid-mono-internal?`
 
@@ -67,7 +67,7 @@ When reviewing or proposing pull requests, start an iterative review discussion:
 # Submit final approved review to GitHub
 ./discuss-with-muse.sh submit --pr 65 --approve
 ```
-Every discussion turn is broadcast live to `#code-review` so you can watch the debate unfold and chime in at any point.
+Every discussion turn is broadcast live to `#refineid` so you can watch the debate unfold and chime in at any point.
 
 ### 3. Symmetrical AGV Reviews for Muse
 When Muse performs work, it can engage Antigravity in an identical multi-turn discussion:
