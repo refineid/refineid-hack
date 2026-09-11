@@ -54,6 +54,10 @@ AGY_BIN = os.environ.get("AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
 LOCK_FILE_OBJ = None
 LAST_M1_MESSAGE_TIME = 0.0
 
+ALL_BOT_NICKS = {
+    "ag", "antigravity", "agv", "muse", "ci", "gh", "builder", "build", "check", "card", "pcsc", "m1"
+}
+
 GREETING_EXACT = {
     "hi", "hi!", "hello", "hello!", "hey", "hey!", "hei", "hei!",
     "moro", "moro!", "terve", "terve!", "yo", "yo!", "ping", "ping!"
@@ -529,6 +533,9 @@ class M1IrcClient:
             log_daemon(f"Error in reclaim loop: {e}")
 
     async def handle_message(self, sender, channel, text):
+        if sender.lower() in ALL_BOT_NICKS:
+            return
+
         target = channel if channel.startswith("#") else sender
         addressed_to, mode, query = parse_addressing(text)
 

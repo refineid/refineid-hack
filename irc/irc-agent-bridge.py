@@ -878,6 +878,9 @@ class IrcBot:
             log_daemon(f"[{self.nick}] Error in reclaim nick loop: {e}")
 
     async def handle_channel_message(self, sender, channel, text):
+        if sender.lower() in ALL_BOT_NICKS:
+            return
+
         target = channel if channel.startswith("#") else sender
         addressed_to, mode, query = parse_addressing(text)
 
