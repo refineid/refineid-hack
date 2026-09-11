@@ -201,7 +201,7 @@ $(cat "$TMP_DIR/agv_reply.txt")
 
 EOF
 
-    notify_irc antigravity "#refineid" "$(cat "$TMP_DIR/agv_reply.txt")"
+    notify_irc ag "#refineid" "$(cat "$TMP_DIR/agv_reply.txt")"
 
     cat "$TMP_DIR/agv_reply.txt"
     echo ""
@@ -266,7 +266,7 @@ $(cat "$TMP_DIR/agv_reply.txt")
 
 EOF
 
-    notify_irc antigravity "#refineid" "[Turn $NEXT_TURN from Antigravity]: $(cat "$TMP_DIR/agv_reply.txt")"
+    notify_irc ag "#refineid" "[Turn $NEXT_TURN from Antigravity]: $(cat "$TMP_DIR/agv_reply.txt")"
 
     cat "$TMP_DIR/agv_reply.txt"
     ;;

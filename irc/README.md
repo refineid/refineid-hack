@@ -1,18 +1,18 @@
 # ReFineID Multi-Agent IRC Review Chatroom
 
-A local, private IRC chatroom where coding agents (`antigravity` and `muse`) collaborate and debate code reviews with the maintainer in real-time.
+A local, private IRC chatroom where coding agents (`ag` and `muse`) collaborate and debate code reviews with the maintainer in real-time.
 
 ```
 +-------------------------------------------------------------+
 |               Local IRC Server (ngIRCd :6667)                |
-|                    Channel: #refineid                     |
+|                    Channel: #refineid                       |
 +------------------------------+------------------------------+
                                |
        +-----------------------+-----------------------+
        |                       |                       |
 +------v-------+        +------v-------+        +------v-------+
-|  Maintainer  |        | Antigravity  |        |  Muse Code   |
-| (petri / pk) |        |    (agv)     |        |   (agent)    |
+|  Maintainer  |        |      ag      |        |     muse     |
+| (petri / pk) |        | (Antigravity)|        |  (Muse Code) |
 +--------------+        +--------------+        +--------------+
 ```
 
@@ -24,7 +24,7 @@ A local, private IRC chatroom where coding agents (`antigravity` and `muse`) col
 ```
 This starts:
 - `ngircd` on `127.0.0.1:6667` with single channel `#refineid` (`Autojoin = yes`).
-- `irc-agent-bridge.py` which connects `antigravity` and `muse` bots to `#refineid`.
+- `irc-agent-bridge.py` which connects `ag` and `muse` bots to `#refineid`.
 
 ### 2. Connect Your IRC Client
 Connect from any terminal:
@@ -37,22 +37,31 @@ weechat -r "/server add local 127.0.0.1/6667; /connect local; /join #refineid"
 
 # netcat (minimalist)
 nc 127.0.0.1 6667
-# Then enter:
-# NICK petri
-# USER petri 0 * :Petri
-# JOIN #refineid
 ```
 
 ## How It Works
 
 ### 1. Interactive In-Channel Agent Prompts
-You can chat with agents directly in `#refineid` or `#refineid`:
+You can chat with agents directly in `#refineid`:
+- `ag: what are the pre-commit checks in refineid-mono-internal?`
 - `muse: check if line 295 in site/beta/index.html matches the clone command`
-- `antigravity: what are the pre-commit checks in refineid-mono-internal?`
 
-The bridge routes the message to the corresponding agent runtime (`muse exec --yolo` or `agy --print`) and sends the response back to IRC.
+The bridge routes the message to the corresponding agent runtime (`agy --print` or `muse exec --yolo`) and sends the response back to IRC.
 
-### 2. Persistent Multi-Turn PR Reviews
+### 2. Persistent Chat Logging & Agent Reading
+All chats and events in `#refineid` are logged to:
+- `irc/logs/channel-refineid.log` (and symlinked at `/tmp/irc-channel-refineid.log`).
+
+Agents and maintainer can inspect the chat history anytime:
+```bash
+irc-logs          # View last 50 lines
+irc-logs 20       # View last 20 lines
+irc-logs -f       # Follow live chat in real time
+irc-logs -s "PR"  # Search chat history
+```
+When an agent is addressed (`ag:` or `muse:`), recent chat context is automatically supplied to the agent.
+
+### 3. Persistent Multi-Turn PR Reviews
 When reviewing or proposing pull requests, start an iterative review discussion:
 ```bash
 # Start a review session with Muse
@@ -69,7 +78,7 @@ When reviewing or proposing pull requests, start an iterative review discussion:
 ```
 Every discussion turn is broadcast live to `#refineid` so you can watch the debate unfold and chime in at any point.
 
-### 3. Symmetrical AGV Reviews for Muse
+### 4. Symmetrical AGV Reviews for Muse
 When Muse performs work, it can engage Antigravity in an identical multi-turn discussion:
 ```bash
 ./discuss-with-agv.sh start --pr <NUM>

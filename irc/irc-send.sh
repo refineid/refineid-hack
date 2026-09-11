@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# irc-send.sh - Send a message to local IRC as antigravity or muse
-BOT="${1:-antigravity}"
+# irc-send.sh - Send a message to local IRC as ag or muse
+BOT="${1:-ag}"
+if [[ "$BOT" == "antigravity" || "$BOT" == "agv" ]]; then
+  BOT="ag"
+fi
 CHANNEL="${2:-#refineid}"
 shift 2 || true
 MESSAGE="$*"

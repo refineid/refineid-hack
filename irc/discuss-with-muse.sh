@@ -124,9 +124,9 @@ case "$COMMAND" in
     gh pr view "$PR_NUM" --repo "$REPO" > "$TMP_DIR/context.txt"
     gh pr diff "$PR_NUM" --repo "$REPO" > "$TMP_DIR/diff.patch"
 
-    notify_irc antigravity "#refineid" "--- Review Discussion Started for $REPO PR #$PR_NUM (Session: $SESSION_ID) ---"
+    notify_irc ag "#refineid" "--- Review Discussion Started for $REPO PR #$PR_NUM (Session: $SESSION_ID) ---"
     if [[ -n "$INTENT" ]]; then
-      notify_irc antigravity "#refineid" "Author intent: $INTENT"
+      notify_irc ag "#refineid" "Author intent: $INTENT"
     fi
 
     cat << 'EOF' > "$TMP_DIR/prompt.md"
@@ -234,7 +234,7 @@ EOF
     TMP_DIR=$(mktemp -d -t discuss-muse-reply-XXXXXX)
     trap 'rm -rf "$TMP_DIR"' EXIT
 
-    notify_irc antigravity "#refineid" "[Turn $NEXT_TURN to Muse]: $CONTENT"
+    notify_irc ag "#refineid" "[Turn $NEXT_TURN to Muse]: $CONTENT"
 
     echo "==> Sending Turn $NEXT_TURN to Muse session $SESSION_ID..." >&2
     cat << EOF > "$TMP_DIR/reply_prompt.md"
@@ -294,7 +294,7 @@ EOF
         gh pr review "$PR_NUM" --repo "$REPO" --comment --body-file "$TRANSCRIPT_FILE"
         ;;
     esac
-    notify_irc antigravity "#refineid" "Discussion transcript posted to GitHub PR #$PR_NUM ($SUBMIT_EVENT)."
+    notify_irc ag "#refineid" "Discussion transcript posted to GitHub PR #$PR_NUM ($SUBMIT_EVENT)."
     echo "==> Transcript posted successfully to GitHub PR #$PR_NUM!" >&2
     ;;
 
