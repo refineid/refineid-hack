@@ -47,9 +47,9 @@ CHAT_LOG_DIR = os.path.join(IRC_DIR, "logs")
 CHAT_LOG_FILE = os.path.join(CHAT_LOG_DIR, "channel-refineid-prod.log")
 SYMLINK_LOG_FILE = "/tmp/irc-channel-refineid.log"
 
-MUSE_BIN = os.environ.get("MUSE_BIN", "/Users/pk/.local/bin/muse")
-AGY_BIN = os.environ.get("AGY_BIN", "/Users/pk/.local/bin/agy")
-WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/Users/pk/src")
+MUSE_BIN = os.environ.get("MUSE_BIN", os.path.expanduser("~/.local/bin/muse"))
+AGY_BIN = os.environ.get("AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
+WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", os.path.expanduser("~/src"))
 
 ALL_BOT_NICKS = ("ag", "antigravity", "agv", "muse", "ci", "gh", "builder", "build", "check", "card", "pcsc")
 
@@ -518,29 +518,57 @@ async def handle_card_query(sender, query):
         )
 
     readers = []
-    try:
-        pcsc = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/PCSC.framework/PCSC")
-        hContext = ctypes.c_void_p()
-        if pcsc.SCardEstablishContext(0, None, None, ctypes.byref(hContext)) == 0:
-            pcch = ctypes.c_uint32()
-            if pcsc.SCardListReaders(hContext, None, None, ctypes.byref(pcch)) == 0 and pcch.value > 1:
-                buf = ctypes.create_string_buffer(pcch.value)
-                if pcsc.SCardListReaders(hContext, None, buf, ctypes.byref(pcch)) == 0:
-                    readers = [r.decode("utf-8", errors="replace") for r in buf.raw.split(b"\x00") if r]
-            pcsc.SCardReleaseContext(hContext)
-    except Exception as e:
-        readers = [f"PCSC error: {e}"]
-
     cards = []
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "security", "list-smartcards",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        cards = [l.strip() for l in stdout.decode().splitlines() if l.strip()]
-    except Exception:
-        pass
+    if sys.platform == "darwin":
+        try:
+            pcsc = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/PCSC.framework/PCSC")
+            hContext = ctypes.c_void_p()
+            if pcsc.SCardEstablishContext(0, None, None, ctypes.byref(hContext)) == 0:
+                pcch = ctypes.c_uint32()
+                if pcsc.SCardListReaders(hContext, None, None, ctypes.byref(pcch)) == 0 and pcch.value > 1:
+                    buf = ctypes.create_string_buffer(pcch.value)
+                    if pcsc.SCardListReaders(hContext, None, buf, ctypes.byref(pcch)) == 0:
+                        readers = [r.decode("utf-8", errors="replace") for r in buf.raw.split(b"\x00") if r]
+                pcsc.SCardReleaseContext(hContext)
+        except Exception as e:
+            readers = [f"PCSC error: {e}"]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "security", "list-smartcards",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            cards = [l.strip() for l in stdout.decode().splitlines() if l.strip()]
+        except Exception:
+            pass
+    else:
+        # Linux (e.g. oc.daemon.fi): Query opensc-tool
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "opensc-tool", "-l",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            out_lines = [l.strip() for l in stdout.decode().splitlines() if l.strip()]
+            for l in out_lines:
+                if not l.lower().startswith("no smart card") and not l.lower().startswith("failed"):
+                    readers.append(l)
+        except Exception as e:
+            readers = [f"opensc error: {e}"]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "opensc-tool", "-a",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            out_lines = [l.strip() for l in stdout.decode().splitlines() if l.strip()]
+            for l in out_lines:
+                if not l.lower().startswith("no smart card") and not l.lower().startswith("failed"):
+                    cards.append(l)
+        except Exception:
+            pass
 
     if cmd in ("readers", "reader"):
         if readers:
@@ -748,38 +776,143 @@ class IrcBot:
             else:
                 full_prompt = query
 
-            if self.nick == "muse":
-                cmd = [MUSE_BIN, "exec", "--yolo", full_prompt]
-            else:
-                cmd = [AGY_BIN, "--dangerously-skip-permissions", "--print", full_prompt]
+            reply = ""
+            gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
-            log_daemon(f"[{self.nick}] Executing: {' '.join(cmd)}")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=WORKSPACE_DIR
-            )
-            stdout, stderr = await proc.communicate()
-            out_text = stdout.decode("utf-8", errors="replace")
-            err_text = stderr.decode("utf-8", errors="replace")
+            # 1. Try Google Gemini API if key is configured
+            if gemini_api_key and self.nick in ("ag", "antigravity", "agv"):
+                try:
+                    from google import genai
+                    client = genai.Client(api_key=gemini_api_key)
+                    sys_inst = (
+                        "You are Antigravity ('ag'), the official Google AI coding assistant on ReFineID IRC (#refineid).\n"
+                        "You run as a permanent daemon on oc.daemon.fi.\n"
+                        "Follow AGENTS.md rules strictly:\n"
+                        "- Zero PIN and PIN-length logging across all environments.\n"
+                        "- Preserve ISO-8859-15 encoding and specification symbols (§).\n"
+                        "- Safe Rust owns protocol, parsing, and secrets; unsafe is confined to PC/SC boundaries.\n"
+                        "- Zero AI attribution in commits.\n"
+                        "Provide concise, precise, technical responses formatted for IRC lines (under 400 chars per line)."
+                    )
+                    log_daemon(f"[{self.nick}] Calling Gemini API for {sender}...")
+                    resp = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model="gemini-2.5-flash",
+                        contents=full_prompt,
+                        config=dict(system_instruction=sys_inst)
+                    )
+                    if resp and resp.text:
+                        reply = resp.text.strip()
+                except Exception as e:
+                    log_daemon(f"[{self.nick}] Gemini API call failed: {e}")
 
-            if self.nick == "muse":
-                lines = [l for l in out_text.splitlines() if not l.startswith("muse: workspace")]
-                reply = "\n".join(lines).strip()
-            else:
-                reply = out_text.strip()
+            # 2. Try CLI execution (agy or muse) if available
+            if not reply:
+                cmd = None
+                if self.nick == "muse" and shutil.which(MUSE_BIN):
+                    cmd = [MUSE_BIN, "exec", "--yolo", full_prompt]
+                elif shutil.which(AGY_BIN):
+                    cmd = [AGY_BIN, "--dangerously-skip-permissions", "--print", full_prompt]
 
-            if not reply and err_text:
-                reply = f"stderr: {err_text.strip()}"
-            elif not reply:
-                reply = "(done, no output)"
+                if cmd:
+                    log_daemon(f"[{self.nick}] Executing CLI: {' '.join(cmd)}")
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=WORKSPACE_DIR
+                    )
+                    stdout, stderr = await proc.communicate()
+                    out_text = stdout.decode("utf-8", errors="replace")
+                    err_text = stderr.decode("utf-8", errors="replace")
+
+                    if self.nick == "muse":
+                        lines = [l for l in out_text.splitlines() if not l.startswith("muse: workspace")]
+                        reply = "\n".join(lines).strip()
+                    else:
+                        reply = out_text.strip()
+
+                    if not reply and err_text:
+                        reply = f"stderr: {err_text.strip()}"
+
+            # 3. Built-in autonomous daemon intelligence on oc.daemon.fi
+            if not reply:
+                reply = await handle_autonomous_query(self.nick, sender, query)
 
             log_daemon(f"[{self.nick}] Finished query for {sender}, reply length: {len(reply)} chars")
             await self.privmsg(target, f"{sender}: {reply}")
         except Exception as e:
             log_daemon(f"[{self.nick}] Error executing agent query: {e}")
             await self.privmsg(target, f"{sender}: Error executing agent: {e}")
+
+
+async def handle_autonomous_query(nick, sender, query):
+    """Autonomous built-in intelligence when running as a permanent cloud daemon."""
+    import platform
+    q = query.strip()
+    q_lower = q.lower()
+
+    # 1. System, Host, and Daemon Info
+    if any(k in q_lower for k in ("uptime", "host", "where are you", "who are you", "daemon", "server", "status")):
+        uname = platform.uname()
+        mem_info = "unknown"
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if "MemAvailable" in line:
+                        mem_info = line.split(":")[1].strip()
+                        break
+        except Exception:
+            pass
+        return (
+            f"Antigravity ('{nick}') running as permanent daemon on {uname.node}.\n"
+            f"  Host   : {uname.system} {uname.release} ({uname.machine})\n"
+            f"  Channel: #refineid (ngIRCd :6667 / :6697 TLS)\n"
+            f"  Memory : {mem_info} available\n"
+            f"  Status : Active 24/7 permanent review and coordination daemon."
+        )
+
+    # 2. AGENTS.md Governing Rules
+    if any(k in q_lower for k in ("rule", "rules", "spec", "pin", "agents.md")):
+        return (
+            "AGENTS.md Governing Rules:\n"
+            "  1. ISO-8859-15 encoding: Preserve meaningful symbols (§, €); never degrade to ASCII.\n"
+            "  2. Zero PIN logging: Never log, trace, or format PIN bytes or lengths across all environments.\n"
+            "  3. Safe Rust boundaries: Safe Rust owns protocol & parsing; unsafe inside PC/SC boundary.\n"
+            "  4. Windows ABI validation: Pointer nullability & length must be validated before deref.\n"
+            "  5. Zero AI attribution in git commits."
+        )
+
+    # 3. Git / Codebase queries
+    if any(k in q_lower for k in ("git", "repo", "commit", "diff", "branch", "pr", "log")):
+        repos = []
+        if os.path.isdir(WORKSPACE_DIR):
+            for d in sorted(os.listdir(WORKSPACE_DIR)):
+                full = os.path.join(WORKSPACE_DIR, d)
+                if os.path.isdir(os.path.join(full, ".git")):
+                    repos.append(d)
+        if ("log" in q_lower or "commit" in q_lower) and repos:
+            rpath = os.path.join(WORKSPACE_DIR, repos[0])
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", rpath, "log", "-n", "3", "--oneline",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await proc.communicate()
+                return f"Latest commits in {repos[0]}:\n" + stdout.decode().strip()
+            except Exception:
+                pass
+        if repos:
+            return f"Cloned repositories on oc.daemon.fi ({len(repos)}): " + ", ".join(repos)
+        return "No local repositories cloned yet in " + WORKSPACE_DIR
+
+    # 4. Default helpful response with Gemini API setup instructions
+    return (
+        f"I received your request: '{q}'.\n"
+        f"I am running as a permanent daemon on oc.daemon.fi. "
+        f"To enable direct generative Gemini LLM turns, set GEMINI_API_KEY in /home/pk/.config/refineid/env. "
+        f"Available built-in commands: 'ci: prs', 'builder: status', 'card: status', 'ag: rules', 'ag: status'."
+    )
 
 
 async def handle_unix_client(reader, writer, bots):
