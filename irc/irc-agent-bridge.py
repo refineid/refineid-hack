@@ -182,7 +182,7 @@ def parse_addressing(text):
                 return (bot, "direct", "")
 
     # 4. Other user nick addressing (e.g. "petri: ...") -> addressed to someone else!
-    m = re.match(r"^([a-zA-Z0-9_\-\[\]\]+)[:,]\s*(.*)$", stripped)
+    m = re.match(r"^([a-zA-Z0-9_\-\[\]]+)[:,]\s*(.*)$", stripped)
     if m:
         return (m.group(1).lower(), "other", m.group(2).strip())
 
