@@ -4,7 +4,7 @@
 <dict>
   <key>keychain-access-groups</key>
   <array>
-    <string>4ZJC3SFJR2.fi.refineid.ReFineID</string>
+    <string>4ZJC3SFJR2.fi.refineid.refineid</string>
     <string>4ZJC3SFJR2.fi.refineid.internal</string>
   </array>
 </dict>

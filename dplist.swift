@@ -44,7 +44,7 @@ func list(label: String, accessGroup: String?) {
 let groups =
   CommandLine.arguments.dropFirst().isEmpty
   ? [
-    "4ZJC3SFJR2.fi.refineid.ReFineID",
+    "4ZJC3SFJR2.fi.refineid.refineid",
     "4ZJC3SFJR2.fi.refineid.internal",
   ] : Array(CommandLine.arguments.dropFirst())
 list(label: "no-group", accessGroup: nil)
