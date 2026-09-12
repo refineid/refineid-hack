@@ -11,7 +11,7 @@
 //   ./dplist.app/Contents/MacOS/dplist [group ...]
 //
 // With no group arguments, lists the ungrouped store plus the two known
-// ReFineID groups. Secrets are never fetched: attributes enumerate silently,
+// RefineID groups. Secrets are never fetched: attributes enumerate silently,
 // secret bytes would prompt per item.
 import Foundation
 import Security

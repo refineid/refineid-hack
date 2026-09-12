@@ -28,7 +28,7 @@ fi
 
 if [[ "$MODE" == "status" ]]; then
   echo "=================================================================="
-  echo "         ReFineID Multi-Agent IRC Review Environments"
+  echo "         RefineID Multi-Agent IRC Review Environments"
   echo "=================================================================="
   echo -n " [TEST] Local Server (127.0.0.1:6667) : "
   if nc -z 127.0.0.1 6667 2>/dev/null; then
@@ -83,7 +83,7 @@ if [[ "$MODE" == "test" ]]; then
 
   echo ""
   echo "=================================================================="
-  echo "        [TEST] ReFineID Local Test IRC Review Environment"
+  echo "        [TEST] RefineID Local Test IRC Review Environment"
   echo "=================================================================="
   echo " Environment: LOCAL TEST / DEVELOPMENT"
   echo " Server     : 127.0.0.1:6667 (local ngIRCd)"
@@ -121,7 +121,7 @@ fi
 
 echo ""
 echo "=================================================================="
-echo "      [PROD] ReFineID Production IRC Review Environment"
+echo "      [PROD] RefineID Production IRC Review Environment"
 echo "=================================================================="
 echo " Environment: PRODUCTION (oc.daemon.fi)"
 echo " Server     : oc.daemon.fi:6697 (Let's Encrypt TLSv1.3)"
