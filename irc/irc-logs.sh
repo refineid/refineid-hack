@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# irc-logs.sh - View and search ReFineID IRC channel chat logs (#refineid)
+# irc-logs.sh - View and search RefineID IRC channel chat logs (#refineid)
 
 LOG_ENV="prod"
 if [[ $# -gt 0 ]]; then
@@ -31,7 +31,7 @@ usage() {
   cat <<EOF
 Usage: irc-logs [--test | --prod] [options] [lines]
 
-View and search ReFineID IRC chatroom logs (#refineid).
+View and search RefineID IRC chatroom logs (#refineid).
 
 Environments:
   --prod             View production logs from oc.daemon.fi (default)

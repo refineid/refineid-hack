@@ -736,7 +736,7 @@ class IrcBot:
             self.writer = None
         self.reader = None
 
-    async def shutdown(self, reason="ReFineID daemon restart"):
+    async def shutdown(self, reason="RefineID daemon restart"):
         self.running = False
         if self.writer and not self.writer.is_closing():
             try:
@@ -985,7 +985,7 @@ class IrcBot:
                     from google import genai
                     client = genai.Client(api_key=gemini_api_key)
                     sys_inst = (
-                        "You are Antigravity ('ag'), the official Google AI coding assistant on ReFineID IRC (#refineid).\n"
+                        "You are Antigravity ('ag'), the official Google AI coding assistant on RefineID IRC (#refineid).\n"
                         "You run as a permanent daemon on oc.daemon.fi.\n"
                         "Follow AGENTS.md rules strictly:\n"
                         "- Zero PIN and PIN-length logging across all environments.\n"
@@ -1137,7 +1137,7 @@ def configure_environment():
     global ENV_NAME, SERVER, PORT, USE_TLS, TLS_SERVER_HOSTNAME, CHANNELS
     global SOCKET_PATH, DAEMON_LOG_FILE, CHAT_LOG_FILE
 
-    parser = argparse.ArgumentParser(description="ReFineID Multi-Agent IRC Review Bridge")
+    parser = argparse.ArgumentParser(description="RefineID Multi-Agent IRC Review Bridge")
     parser.add_argument(
         "--env",
         choices=["prod", "test", "local", "oc"],
@@ -1252,15 +1252,15 @@ async def main():
 
     # 2. Service Bots
     ci_bot = IrcBot(
-        bot_id="ci", nick="ci", realname="ReFineID CI & GitHub Bot",
+        bot_id="ci", nick="ci", realname="RefineID CI & GitHub Bot",
         handler=handle_ci_query
     )
     builder_bot = IrcBot(
-        bot_id="builder", nick="builder", realname="ReFineID Build & Verifier Bot",
+        bot_id="builder", nick="builder", realname="RefineID Build & Verifier Bot",
         handler=handle_builder_query
     )
     card_bot = IrcBot(
-        bot_id="card", nick="card", realname="ReFineID Smart Card Monitor",
+        bot_id="card", nick="card", realname="RefineID Smart Card Monitor",
         handler=handle_card_query
     )
 

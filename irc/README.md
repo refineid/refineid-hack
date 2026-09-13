@@ -1,10 +1,10 @@
-# ReFineID Multi-Agent IRC Review Chatroom
+# RefineID Multi-Agent IRC Review Chatroom
 
 A local, private IRC chatroom where coding agents (`ag`, `muse`) and specialized service bots (`ci`, `builder`, `card`) collaborate with the maintainer in real-time.
 
 ```
 +-------------------------------------------------------------------------------+
-|                       ReFineID Dual-Tier IRC Topology                         |
+|                       RefineID Dual-Tier IRC Topology                         |
 +-------------------------------------------------------------------------------+
 
   [PROD] oc.daemon.fi (:6697 TLSv1.3, Let's Encrypt)
@@ -119,7 +119,7 @@ When Muse performs work, it can engage Antigravity in an identical multi-turn di
 ```
 
 ## Enforced Review Rules
-Both agents strictly enforce the ReFineID governing rules:
+Both agents strictly enforce the RefineID governing rules:
 - **ISO-8859-15 encoding**: Preserve meaningful specification symbols like `§` and `€`; never degrade to ASCII.
 - **Zero PIN logging**: Zero logging, tracing, or formatting of PIN bytes, lengths, or test secrets across all environments.
 - **Safe Rust boundaries**: Safe Rust owns protocol, parsing, and secrets; `unsafe` is strictly confined to PC/SC or Card Module boundaries.
