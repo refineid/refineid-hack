@@ -1282,7 +1282,7 @@ async def main():
         lambda r, w: handle_unix_client(r, w, bots),
         SOCKET_PATH
     )
-    os.chmod(SOCKET_PATH, 0o777)
+    os.chmod(SOCKET_PATH, 0o600)
     log_daemon(f"IRC Agent Bridge running. Socket at {SOCKET_PATH}, Chat log at {CHAT_LOG_FILE}")
 
     # Setup signal handlers for graceful shutdown

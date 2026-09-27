@@ -708,7 +708,7 @@ async def main():
         lambda r, w: handle_unix_client(r, w, client),
         SOCKET_PATH
     )
-    os.chmod(SOCKET_PATH, 0o777)
+    os.chmod(SOCKET_PATH, 0o600)
     log_daemon(f"m1 agent running. Socket at {SOCKET_PATH}, Chat log at {CHAT_LOG_FILE}")
 
     loop = asyncio.get_running_loop()
