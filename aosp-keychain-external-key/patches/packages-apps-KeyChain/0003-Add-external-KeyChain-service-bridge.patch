@@ -1,0 +1,1545 @@
+From 44559eb44bd4f9e458ed190d836999115191f9df Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 16:08:21 +0300
+Subject: [PATCH 3/3] Add external KeyChain service bridge
+
+---
+ .../android/keychain/ExternalKeyCaller.java   |  59 +++
+ .../android/keychain/ExternalKeyIdentity.java | 209 ++++++++
+ .../android/keychain/ExternalKeyManager.java  | 342 ++++++++++++
+ .../android/keychain/ExternalKeyProvider.java |  41 ++
+ src/com/android/keychain/KeyChainService.java | 116 ++++-
+ .../keychain/internal/GrantsDatabase.java     |  14 +
+ .../keychain/ExternalKeyManagerTest.java      | 485 ++++++++++++++++++
+ .../tests/BasicKeyChainServiceTest.java       |  13 +-
+ 8 files changed, 1267 insertions(+), 12 deletions(-)
+ create mode 100644 src/com/android/keychain/ExternalKeyCaller.java
+ create mode 100644 src/com/android/keychain/ExternalKeyIdentity.java
+ create mode 100644 src/com/android/keychain/ExternalKeyManager.java
+ create mode 100644 src/com/android/keychain/ExternalKeyProvider.java
+ create mode 100644 tests/src/com/android/keychain/ExternalKeyManagerTest.java
+
+diff --git a/src/com/android/keychain/ExternalKeyCaller.java b/src/com/android/keychain/ExternalKeyCaller.java
+new file mode 100644
+index 0000000..d9bf1ed
+--- /dev/null
++++ b/src/com/android/keychain/ExternalKeyCaller.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.keychain;
++
++import android.annotation.NonNull;
++
++import java.util.Arrays;
++import java.util.Objects;
++
++/** Binder-derived identity of an application using an external KeyChain key. */
++final class ExternalKeyCaller {
++    private static final int MINIMUM_PACKAGE_COUNT = 1;
++
++    private final int mUid;
++    private final @NonNull String[] mPackageNames;
++
++    ExternalKeyCaller(int uid, @NonNull String[] packageNames) {
++        Objects.requireNonNull(packageNames);
++        if (packageNames.length < MINIMUM_PACKAGE_COUNT) {
++            throw new IllegalArgumentException("External-key caller has no installed package");
++        }
++        mPackageNames = packageNames.clone();
++        for (String packageName : mPackageNames) {
++            if (packageName == null || packageName.isEmpty()) {
++                throw new IllegalArgumentException("External-key caller package is empty");
++            }
++        }
++        Arrays.sort(mPackageNames);
++        mUid = uid;
++    }
++
++    int getUid() {
++        return mUid;
++    }
++
++    @NonNull
++    String[] copyPackageNames() {
++        return mPackageNames.clone();
++    }
++
++    @Override
++    public String toString() {
++        return "ExternalKeyCaller{uid=" + mUid + ", packageCount=" + mPackageNames.length + '}';
++    }
++}
+diff --git a/src/com/android/keychain/ExternalKeyIdentity.java b/src/com/android/keychain/ExternalKeyIdentity.java
+new file mode 100644
+index 0000000..aa65157
+--- /dev/null
++++ b/src/com/android/keychain/ExternalKeyIdentity.java
+@@ -0,0 +1,209 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.keychain;
++
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.security.keystore.KeyProperties;
++
++import java.io.ByteArrayInputStream;
++import java.security.PublicKey;
++import java.security.cert.Certificate;
++import java.security.cert.CertificateEncodingException;
++import java.security.cert.CertificateException;
++import java.security.cert.CertificateFactory;
++import java.security.cert.X509Certificate;
++import java.security.interfaces.ECPublicKey;
++import java.security.interfaces.RSAKey;
++import java.security.spec.ECParameterSpec;
++import java.util.Collection;
++import java.util.Objects;
++
++/** One validated snapshot of the active external client-authentication identity. */
++final class ExternalKeyIdentity {
++    private static final int MINIMUM_CERTIFICATE_LENGTH_BYTES = 1;
++    private static final int MINIMUM_PUBLIC_KEY_LENGTH_BYTES = 1;
++    private static final int P384_KEY_SIZE_BITS = 384;
++    private static final int NO_REMAINING_BYTES = 0;
++    private static final int NO_CA_CERTIFICATE_LENGTH_BYTES = 0;
++    private static final long FIRST_PROVIDER_GENERATION = 1L;
++
++    private final @NonNull byte[] mLeafCertificate;
++    private final @Nullable byte[] mCaCertificates;
++    private final @NonNull String mKeyAlgorithm;
++    private final @NonNull byte[] mEncodedPublicKey;
++    private final @NonNull PublicKey mPublicKey;
++    private final long mProviderGeneration;
++
++    private ExternalKeyIdentity(
++            @NonNull byte[] leafCertificate,
++            @Nullable byte[] caCertificates,
++            @NonNull String keyAlgorithm,
++            @NonNull byte[] encodedPublicKey,
++            @NonNull PublicKey publicKey,
++            long providerGeneration) {
++        mLeafCertificate = leafCertificate;
++        mCaCertificates = caCertificates;
++        mKeyAlgorithm = keyAlgorithm;
++        mEncodedPublicKey = encodedPublicKey;
++        mPublicKey = publicKey;
++        mProviderGeneration = providerGeneration;
++    }
++
++    @NonNull
++    static ExternalKeyIdentity create(
++            @NonNull byte[] leafCertificate,
++            @Nullable byte[] caCertificates,
++            long providerGeneration)
++            throws CertificateException {
++        Objects.requireNonNull(leafCertificate);
++        if (leafCertificate.length < MINIMUM_CERTIFICATE_LENGTH_BYTES) {
++            throw new CertificateException("External leaf certificate is empty");
++        }
++        if (providerGeneration < FIRST_PROVIDER_GENERATION) {
++            throw new IllegalArgumentException("External provider generation must be positive");
++        }
++
++        X509Certificate parsedLeaf = parseSingleCertificate(leafCertificate);
++        PublicKey publicKey = parsedLeaf.getPublicKey();
++        String keyAlgorithm = publicKey.getAlgorithm();
++        if (!KeyProperties.KEY_ALGORITHM_RSA.equals(keyAlgorithm)
++                && !KeyProperties.KEY_ALGORITHM_EC.equals(keyAlgorithm)) {
++            throw new CertificateException("External certificate uses an unsupported key");
++        }
++        if (KeyProperties.KEY_ALGORITHM_RSA.equals(keyAlgorithm)
++                && !(publicKey instanceof RSAKey)) {
++            throw new CertificateException("External RSA certificate has an invalid public key");
++        }
++        if (KeyProperties.KEY_ALGORITHM_EC.equals(keyAlgorithm)) {
++            if (!(publicKey instanceof ECPublicKey)) {
++                throw new CertificateException("External EC certificate has an invalid public key");
++            }
++            ECParameterSpec parameters = ((ECPublicKey) publicKey).getParams();
++            if (parameters == null
++                    || parameters.getCurve().getField().getFieldSize() != P384_KEY_SIZE_BITS) {
++                throw new CertificateException("External EC certificate is not P-384");
++            }
++        }
++        byte[] encodedPublicKey = publicKey.getEncoded();
++        if (encodedPublicKey == null || encodedPublicKey.length < MINIMUM_PUBLIC_KEY_LENGTH_BYTES) {
++            throw new CertificateException("External certificate has no encoded public key");
++        }
++
++        byte[] canonicalLeaf = encodeCertificate(parsedLeaf);
++        byte[] validatedCaCertificates = validateCaCertificates(caCertificates);
++        return new ExternalKeyIdentity(
++                canonicalLeaf,
++                validatedCaCertificates,
++                keyAlgorithm,
++                encodedPublicKey.clone(),
++                publicKey,
++                providerGeneration);
++    }
++
++    @NonNull
++    byte[] copyLeafCertificate() {
++        return mLeafCertificate.clone();
++    }
++
++    @Nullable
++    byte[] copyCaCertificates() {
++        return mCaCertificates == null ? null : mCaCertificates.clone();
++    }
++
++    @NonNull
++    String getKeyAlgorithm() {
++        return mKeyAlgorithm;
++    }
++
++    @NonNull
++    byte[] copyEncodedPublicKey() {
++        return mEncodedPublicKey.clone();
++    }
++
++    @NonNull
++    PublicKey getPublicKey() {
++        return mPublicKey;
++    }
++
++    long getProviderGeneration() {
++        return mProviderGeneration;
++    }
++
++    @Override
++    public String toString() {
++        return "ExternalKeyIdentity{"
++                + "algorithm="
++                + mKeyAlgorithm
++                + ", leafLength="
++                + mLeafCertificate.length
++                + ", chainLength="
++                + (mCaCertificates == null
++                        ? NO_CA_CERTIFICATE_LENGTH_BYTES
++                        : mCaCertificates.length)
++                + ", providerGeneration="
++                + mProviderGeneration
++                + '}';
++    }
++
++    @NonNull
++    private static X509Certificate parseSingleCertificate(@NonNull byte[] encoded)
++            throws CertificateException {
++        ByteArrayInputStream source = new ByteArrayInputStream(encoded);
++        Certificate certificate =
++                CertificateFactory.getInstance("X.509").generateCertificate(source);
++        if (!(certificate instanceof X509Certificate) || source.available() != NO_REMAINING_BYTES) {
++            throw new CertificateException("External leaf certificate is malformed");
++        }
++        return (X509Certificate) certificate;
++    }
++
++    @NonNull
++    private static byte[] encodeCertificate(@NonNull X509Certificate certificate)
++            throws CertificateException {
++        try {
++            return certificate.getEncoded();
++        } catch (CertificateEncodingException exception) {
++            throw new CertificateException(
++                    "External leaf certificate cannot be encoded", exception);
++        }
++    }
++
++    @Nullable
++    private static byte[] validateCaCertificates(@Nullable byte[] encoded)
++            throws CertificateException {
++        if (encoded == null) {
++            return null;
++        }
++        if (encoded.length < MINIMUM_CERTIFICATE_LENGTH_BYTES) {
++            throw new CertificateException("External CA certificate chain is empty");
++        }
++
++        ByteArrayInputStream source = new ByteArrayInputStream(encoded);
++        Collection<? extends Certificate> certificates =
++                CertificateFactory.getInstance("X.509").generateCertificates(source);
++        if (certificates.isEmpty() || source.available() != NO_REMAINING_BYTES) {
++            throw new CertificateException("External CA certificate chain is malformed");
++        }
++        for (Certificate certificate : certificates) {
++            if (!(certificate instanceof X509Certificate)) {
++                throw new CertificateException("External CA certificate is not X.509");
++            }
++        }
++        return encoded.clone();
++    }
++}
+diff --git a/src/com/android/keychain/ExternalKeyManager.java b/src/com/android/keychain/ExternalKeyManager.java
+new file mode 100644
+index 0000000..af4ac16
+--- /dev/null
++++ b/src/com/android/keychain/ExternalKeyManager.java
+@@ -0,0 +1,342 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.keychain;
++
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.security.KeyChainExternalSignatureRequest;
++import android.security.KeyChainExternalSignatureResult;
++import android.security.KeyChainPrivateKeyDescriptor;
++import android.security.keystore.KeyProperties;
++
++import java.security.PublicKey;
++import java.security.interfaces.RSAKey;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Objects;
++
++/** KeyChain-owned namespace, validation, and failure boundary for one trusted provider. */
++final class ExternalKeyManager {
++    static final String KEYCHAIN_ALIAS = "refineid-client-authentication";
++
++    private static final int DER_SEQUENCE_TAG = 0x30;
++    private static final int DER_INTEGER_TAG = 0x02;
++    private static final int DER_SHORT_FORM_LIMIT = 0x80;
++    private static final int DER_SIGN_BIT_MASK = 0x80;
++    private static final int DER_UNSIGNED_PADDING = 0x00;
++    private static final int UNSIGNED_BYTE_MASK = 0xFF;
++    private static final int P384_SCALAR_LENGTH_BITS = 384;
++    private static final int P384_SCALAR_LENGTH_BYTES = P384_SCALAR_LENGTH_BITS / Byte.SIZE;
++    private static final int DER_POSITIVE_PADDING_LENGTH_BYTES = 1;
++    private static final int MAXIMUM_DER_INTEGER_LENGTH_BYTES =
++            P384_SCALAR_LENGTH_BYTES + DER_POSITIVE_PADDING_LENGTH_BYTES;
++    private static final int FIRST_DER_OFFSET = 0;
++    private static final int DER_TAG_LENGTH_BYTES = 1;
++    private static final int NO_REMAINING_BYTES = 0;
++    private static final int NO_MASKED_BITS = 0;
++    private static final int BITS_TO_BYTES_ROUNDING_OFFSET = Byte.SIZE - 1;
++    private static final byte CLEARED_BYTE = 0;
++
++    private final @NonNull ExternalKeyProvider mProvider;
++    private volatile boolean mClosed;
++
++    ExternalKeyManager(@NonNull ExternalKeyProvider provider) {
++        mProvider = Objects.requireNonNull(provider);
++    }
++
++    @NonNull
++    static ExternalKeyManager unavailable() {
++        return new ExternalKeyManager(new UnavailableProvider());
++    }
++
++    static boolean isExternalAlias(@Nullable String alias) {
++        return KEYCHAIN_ALIAS.equals(alias);
++    }
++
++    @NonNull
++    List<String> getActiveAliases() {
++        return getActiveIdentity() == null
++                ? Collections.emptyList()
++                : Collections.singletonList(KEYCHAIN_ALIAS);
++    }
++
++    boolean containsActiveAlias(@Nullable String alias) {
++        return isExternalAlias(alias) && getActiveIdentity() != null;
++    }
++
++    @Nullable
++    KeyChainPrivateKeyDescriptor getPrivateKeyDescriptor(@Nullable String alias) {
++        ExternalKeyIdentity identity = getIdentityForAlias(alias);
++        if (identity == null) {
++            return null;
++        }
++        return KeyChainPrivateKeyDescriptor.forExternalKey(
++                KEYCHAIN_ALIAS,
++                identity.getKeyAlgorithm(),
++                identity.copyEncodedPublicKey(),
++                identity.getProviderGeneration());
++    }
++
++    @Nullable
++    byte[] getCertificate(@Nullable String alias) {
++        ExternalKeyIdentity identity = getIdentityForAlias(alias);
++        return identity == null ? null : identity.copyLeafCertificate();
++    }
++
++    @Nullable
++    byte[] getCaCertificates(@Nullable String alias) {
++        ExternalKeyIdentity identity = getIdentityForAlias(alias);
++        return identity == null ? null : identity.copyCaCertificates();
++    }
++
++    @NonNull
++    KeyChainExternalSignatureResult sign(
++            @NonNull ExternalKeyCaller caller, @NonNull KeyChainExternalSignatureRequest request) {
++        Objects.requireNonNull(caller);
++        Objects.requireNonNull(request);
++
++        if (!isExternalAlias(request.getExternalAlias()) || !isOpen(request)) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++        }
++        ExternalKeyIdentity identity = getActiveIdentity();
++        if (identity == null) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++        }
++        if (request.getProviderGeneration() != identity.getProviderGeneration()) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_PROVIDER_GENERATION_CHANGED);
++        }
++        if (!identity.getKeyAlgorithm()
++                .equals(KeyChainExternalSignatureRequest.getKeyAlgorithm(request.getAlgorithm()))) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++        }
++        if (Thread.currentThread().isInterrupted()) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_CALLER_INTERRUPTED);
++        }
++
++        try {
++            KeyChainExternalSignatureResult providerResult = mProvider.sign(caller, request);
++            if (providerResult == null) {
++                return failure(KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR);
++            }
++            try (KeyChainExternalSignatureResult ownedProviderResult = providerResult) {
++                if (!ownedProviderResult.isSuccess()) {
++                    return failure(ownedProviderResult.getFailure());
++                }
++                byte[] signature = ownedProviderResult.copySignature();
++                try {
++                    if (!hasValidSignatureShape(identity, signature)) {
++                        return failure(KeyChainExternalSignatureResult.FAILURE_SIGNING_FAILED);
++                    }
++                    return KeyChainExternalSignatureResult.success(signature);
++                } finally {
++                    Arrays.fill(signature, CLEARED_BYTE);
++                }
++            }
++        } catch (RuntimeException | AssertionError exception) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR);
++        }
++    }
++
++    boolean removeActiveIdentity(@Nullable String alias) {
++        ExternalKeyIdentity identity = getIdentityForAlias(alias);
++        if (identity == null) {
++            return false;
++        }
++        long removedGeneration = identity.getProviderGeneration();
++        try {
++            if (!mProvider.removeIdentity(removedGeneration)) {
++                return false;
++            }
++        } catch (RuntimeException | AssertionError exception) {
++            return false;
++        }
++        ExternalKeyIdentity currentIdentity = getActiveIdentity();
++        return currentIdentity == null
++                || currentIdentity.getProviderGeneration() != removedGeneration;
++    }
++
++    synchronized void close() {
++        if (mClosed) {
++            return;
++        }
++        mClosed = true;
++        try {
++            mProvider.close();
++        } catch (RuntimeException | AssertionError exception) {
++            // Service shutdown is already fail-closed.
++        }
++    }
++
++    @Nullable
++    private ExternalKeyIdentity getIdentityForAlias(@Nullable String alias) {
++        return isExternalAlias(alias) ? getActiveIdentity() : null;
++    }
++
++    @Nullable
++    private ExternalKeyIdentity getActiveIdentity() {
++        if (mClosed) {
++            return null;
++        }
++        try {
++            return mProvider.getActiveIdentity();
++        } catch (RuntimeException | AssertionError exception) {
++            return null;
++        }
++    }
++
++    private static boolean isOpen(@NonNull KeyChainExternalSignatureRequest request) {
++        byte[] digest = null;
++        try {
++            digest = request.copyDigest();
++            return true;
++        } catch (IllegalStateException exception) {
++            return false;
++        } finally {
++            if (digest != null) {
++                Arrays.fill(digest, CLEARED_BYTE);
++            }
++        }
++    }
++
++    private static boolean hasValidSignatureShape(
++            @NonNull ExternalKeyIdentity identity, @NonNull byte[] signature) {
++        switch (identity.getKeyAlgorithm()) {
++            case KeyProperties.KEY_ALGORITHM_RSA:
++                PublicKey publicKey = identity.getPublicKey();
++                if (!(publicKey instanceof RSAKey)) {
++                    return false;
++                }
++                int modulusLengthBits = ((RSAKey) publicKey).getModulus().bitLength();
++                int modulusLengthBytes =
++                        (modulusLengthBits + BITS_TO_BYTES_ROUNDING_OFFSET) / Byte.SIZE;
++                return signature.length == modulusLengthBytes;
++            case KeyProperties.KEY_ALGORITHM_EC:
++                return isCanonicalP384EcdsaSignature(signature);
++            default:
++                return false;
++        }
++    }
++
++    static boolean isCanonicalP384EcdsaSignature(@NonNull byte[] signature) {
++        try {
++            int offset = FIRST_DER_OFFSET;
++            offset = requireDerValue(signature, offset, DER_SEQUENCE_TAG);
++            int sequenceLength = requireDerShortLength(signature, offset);
++            offset++;
++            if (sequenceLength != signature.length - offset) {
++                return false;
++            }
++            offset = requireDerInteger(signature, offset);
++            offset = requireDerInteger(signature, offset);
++            return signature.length - offset == NO_REMAINING_BYTES;
++        } catch (IllegalArgumentException exception) {
++            return false;
++        }
++    }
++
++    private static int requireDerInteger(@NonNull byte[] encoded, int offset) {
++        offset = requireDerValue(encoded, offset, DER_INTEGER_TAG);
++        int integerLength = requireDerShortLength(encoded, offset);
++        offset++;
++        if (integerLength < DER_POSITIVE_PADDING_LENGTH_BYTES
++                || integerLength > MAXIMUM_DER_INTEGER_LENGTH_BYTES
++                || integerLength > encoded.length - offset) {
++            throw new IllegalArgumentException("Malformed external ECDSA integer length");
++        }
++
++        int first = encoded[offset] & UNSIGNED_BYTE_MASK;
++        int magnitudeOffset = offset;
++        int magnitudeLength = integerLength;
++        if (first == DER_UNSIGNED_PADDING) {
++            if (integerLength == DER_POSITIVE_PADDING_LENGTH_BYTES) {
++                throw new IllegalArgumentException("External ECDSA integer is zero");
++            }
++            int next = encoded[offset + DER_POSITIVE_PADDING_LENGTH_BYTES] & UNSIGNED_BYTE_MASK;
++            if ((next & DER_SIGN_BIT_MASK) == NO_MASKED_BITS) {
++                throw new IllegalArgumentException("External ECDSA integer has redundant padding");
++            }
++            magnitudeOffset++;
++            magnitudeLength--;
++        } else if ((first & DER_SIGN_BIT_MASK) != NO_MASKED_BITS) {
++            throw new IllegalArgumentException("External ECDSA integer is negative");
++        }
++        if (magnitudeLength > P384_SCALAR_LENGTH_BYTES
++                || isAllZero(encoded, magnitudeOffset, magnitudeLength)) {
++            throw new IllegalArgumentException("External ECDSA integer is out of range");
++        }
++        return offset + integerLength;
++    }
++
++    private static int requireDerValue(@NonNull byte[] encoded, int offset, int expectedTag) {
++        if (offset >= encoded.length || (encoded[offset] & UNSIGNED_BYTE_MASK) != expectedTag) {
++            throw new IllegalArgumentException("Malformed external ECDSA signature");
++        }
++        return offset + DER_TAG_LENGTH_BYTES;
++    }
++
++    private static int requireDerShortLength(@NonNull byte[] encoded, int offset) {
++        if (offset >= encoded.length) {
++            throw new IllegalArgumentException("Missing external ECDSA length");
++        }
++        int length = encoded[offset] & UNSIGNED_BYTE_MASK;
++        if (length >= DER_SHORT_FORM_LIMIT) {
++            throw new IllegalArgumentException("External ECDSA length is not canonical");
++        }
++        return length;
++    }
++
++    private static boolean isAllZero(@NonNull byte[] value, int offset, int length) {
++        int end = offset + length;
++        for (int index = offset; index < end; index++) {
++            if (value[index] != CLEARED_BYTE) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    @NonNull
++    private static KeyChainExternalSignatureResult failure(
++            @KeyChainExternalSignatureResult.Failure int failure) {
++        return KeyChainExternalSignatureResult.failure(failure);
++    }
++
++    private static final class UnavailableProvider implements ExternalKeyProvider {
++        @Override
++        @Nullable
++        public ExternalKeyIdentity getActiveIdentity() {
++            return null;
++        }
++
++        @Override
++        @NonNull
++        public KeyChainExternalSignatureResult sign(
++                @NonNull ExternalKeyCaller caller,
++                @NonNull KeyChainExternalSignatureRequest request) {
++            return failure(KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++        }
++
++        @Override
++        public boolean removeIdentity(long providerGeneration) {
++            return false;
++        }
++
++        @Override
++        public void close() {}
++    }
++}
+diff --git a/src/com/android/keychain/ExternalKeyProvider.java b/src/com/android/keychain/ExternalKeyProvider.java
+new file mode 100644
+index 0000000..c339706
+--- /dev/null
++++ b/src/com/android/keychain/ExternalKeyProvider.java
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.keychain;
++
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.security.KeyChainExternalSignatureRequest;
++import android.security.KeyChainExternalSignatureResult;
++
++/** Trusted source of the active external identity and its exact-digest operation. */
++interface ExternalKeyProvider extends AutoCloseable {
++    /** Returns one immutable identity snapshot, or {@code null} while no identity is active. */
++    @Nullable
++    ExternalKeyIdentity getActiveIdentity();
++
++    /** Signs after KeyChain has authenticated the Binder caller and checked its alias grant. */
++    @NonNull
++    KeyChainExternalSignatureResult sign(
++            @NonNull ExternalKeyCaller caller, @NonNull KeyChainExternalSignatureRequest request);
++
++    /** Removes the exact active generation and makes it unavailable for later queries. */
++    boolean removeIdentity(long providerGeneration);
++
++    /** Releases a binding and rejects subsequent operations. */
++    @Override
++    void close();
++}
+diff --git a/src/com/android/keychain/KeyChainService.java b/src/com/android/keychain/KeyChainService.java
+index bbd3ab5..b6f5cc3 100644
+--- a/src/com/android/keychain/KeyChainService.java
++++ b/src/com/android/keychain/KeyChainService.java
+@@ -113,9 +113,11 @@ public class KeyChainService extends IntentService {
+             "Not system or cert installer package";
+     private static final String MSG_NOT_SYSTEM_OR_CRED_MNG_APP =
+             "Not system or credential management app package";
++    private static final int MINIMUM_EXTERNAL_CALLER_PACKAGE_COUNT = 1;
+ 
+     /** created in onCreate(), closed in onDestroy() */
+     private GrantsDatabase mGrantsDb;
++    private ExternalKeyManager mExternalKeyManager;
+     private Injector mInjector;
+     private KeyStore mKeyStore;
+     private KeyChainStateStorage mStateStorage;
+@@ -162,7 +164,9 @@ public class KeyChainService extends IntentService {
+     @Override public void onCreate() {
+         super.onCreate();
+         mKeyStore = getKeyStore();
+-        mGrantsDb = new GrantsDatabase(this, new KeyStoreAliasesProvider(mKeyStore));
++        mExternalKeyManager = mInjector.getExternalKeyManager(this);
++        mGrantsDb = new GrantsDatabase(
++                this, new KeyStoreAliasesProvider(mKeyStore, mExternalKeyManager));
+         mStateStorage = new KeyChainStateStorage(getDataDir());
+ 
+         synchronized (mCredentialManagementAppLock) {
+@@ -173,15 +177,19 @@ public class KeyChainService extends IntentService {
+     @Override
+     public void onDestroy() {
+         super.onDestroy();
++        mExternalKeyManager.close();
++        mExternalKeyManager = null;
+         mGrantsDb.destroy();
+         mGrantsDb = null;
+     }
+ 
+     private static class KeyStoreAliasesProvider implements ExistingKeysProvider {
+         private final KeyStore mKeyStore;
++        private final ExternalKeyManager mExternalKeyManager;
+ 
+-        KeyStoreAliasesProvider(KeyStore keyStore) {
++        KeyStoreAliasesProvider(KeyStore keyStore, ExternalKeyManager externalKeyManager) {
+             mKeyStore = keyStore;
++            mExternalKeyManager = externalKeyManager;
+         }
+ 
+         @Override
+@@ -191,7 +199,9 @@ public class KeyChainService extends IntentService {
+                 final Enumeration<String> aliases = mKeyStore.aliases();
+                 while (aliases.hasMoreElements()) {
+                     final String alias = aliases.nextElement();
+-                    if (!alias.startsWith(LockPatternUtils.SYNTHETIC_PASSWORD_KEY_PREFIX)) {
++                    if (!ExternalKeyManager.isExternalAlias(alias)
++                            && !alias.startsWith(
++                                    LockPatternUtils.SYNTHETIC_PASSWORD_KEY_PREFIX)) {
+                         if (mKeyStore.isKeyEntry(alias)) {
+                             keyStoreAliases.add(alias);
+                         }
+@@ -202,6 +212,8 @@ public class KeyChainService extends IntentService {
+                         + "List may be empty or incomplete.");
+             }
+ 
++            keyStoreAliases.addAll(mExternalKeyManager.getActiveAliases());
++
+             return keyStoreAliases;
+         }
+     }
+@@ -222,6 +234,9 @@ public class KeyChainService extends IntentService {
+ 
+         @Override
+         public String requestPrivateKey(String alias) {
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return null;
++            }
+             final CallerIdentity caller = getCaller();
+             if (!hasGrant(alias, caller)) {
+                 return null;
+@@ -244,6 +259,10 @@ public class KeyChainService extends IntentService {
+         public String getWifiKeyGrantAsUser(String alias) {
+             Preconditions.checkCallAuthorization(isSystemUid(getCaller()), MSG_NOT_SYSTEM);
+ 
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return null;
++            }
++
+             if (!hasGrant(alias, Process.WIFI_UID)) {
+                 return null;
+             }
+@@ -261,6 +280,13 @@ public class KeyChainService extends IntentService {
+ 
+         @Override
+         public KeyChainPrivateKeyDescriptor requestPrivateKeyDescriptor(String alias) {
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                final CallerIdentity caller = getCaller();
++                if (!hasGrant(alias, caller)) {
++                    return null;
++                }
++                return mExternalKeyManager.getPrivateKeyDescriptor(alias);
++            }
+             final String keyStoreGrant = requestPrivateKey(alias);
+             if (keyStoreGrant == null) {
+                 return null;
+@@ -275,9 +301,37 @@ public class KeyChainService extends IntentService {
+                 return KeyChainExternalSignatureResult.failure(
+                         KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
+             }
+-            request.close();
+-            return KeyChainExternalSignatureResult.failure(
+-                    KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++            try {
++                final CallerIdentity caller = getCaller();
++                final String alias = request.getExternalAlias();
++                if (!ExternalKeyManager.isExternalAlias(alias) || !hasGrant(alias, caller)) {
++                    return KeyChainExternalSignatureResult.failure(
++                            KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++                }
++                final String[] packages = getPackageManager().getPackagesForUid(caller.mUid);
++                if (packages == null
++                        || packages.length < MINIMUM_EXTERNAL_CALLER_PACKAGE_COUNT) {
++                    return KeyChainExternalSignatureResult.failure(
++                            KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR);
++                }
++                return mExternalKeyManager.sign(
++                        new ExternalKeyCaller(caller.mUid, packages), request);
++            } catch (RuntimeException | AssertionError exception) {
++                return KeyChainExternalSignatureResult.failure(
++                        KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR);
++            } finally {
++                request.close();
++            }
++        }
++
++        @Override
++        public StringParceledListSlice getExternalKeyAliases() {
++            Preconditions.checkCallAuthorization(isSystemUid(getCaller()), MSG_NOT_SYSTEM);
++            final List<String> aliases = mExternalKeyManager.getActiveAliases();
++            for (String alias : aliases) {
++                mGrantsDb.ensureIsUserSelectable(alias);
++            }
++            return new StringParceledListSlice(aliases);
+         }
+ 
+         @Override public byte[] getCertificate(String alias) {
+@@ -285,6 +339,9 @@ public class KeyChainService extends IntentService {
+             if (!hasGrant(alias, caller) && !isSystemUid(caller)) {
+                 return null;
+             }
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return mExternalKeyManager.getCertificate(alias);
++            }
+             try {
+                 if (!mKeyStore.isCertificateEntry(alias)) {
+                     final Certificate cert = mKeyStore.getCertificate(alias);
+@@ -304,6 +361,9 @@ public class KeyChainService extends IntentService {
+             if (!hasGrant(alias, caller) && !isSystemUid(caller)) {
+                 return null;
+             }
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return mExternalKeyManager.getCaCertificates(alias);
++            }
+             try {
+                 if (mKeyStore.isCertificateEntry(alias)) {
+                     return mKeyStore.getCertificate(alias).getEncoded();
+@@ -324,6 +384,9 @@ public class KeyChainService extends IntentService {
+ 
+         @Override public boolean isUserSelectable(String alias) {
+             validateAlias(alias);
++            if (mExternalKeyManager.containsActiveAlias(alias)) {
++                mGrantsDb.ensureIsUserSelectable(alias);
++            }
+             return mGrantsDb.isUserSelectable(alias);
+         }
+ 
+@@ -348,6 +411,10 @@ public class KeyChainService extends IntentService {
+                 throw new IllegalArgumentException("The alias specified for the key denotes "
+                         + "a reserved value and cannot be used to name a key");
+             }
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                throw new IllegalArgumentException(
++                        "The alias is reserved for an external KeyChain key");
++            }
+             // Validate the alias here to avoid relying on KeyGenParameterSpec c'tor preventing
+             // the creation of a KeyGenParameterSpec instance with a non-empty alias.
+             if (TextUtils.isEmpty(alias) || spec.getUid() != UID_SELF) {
+@@ -396,6 +463,9 @@ public class KeyChainService extends IntentService {
+         @Override public boolean setKeyPairCertificate(String alias, byte[] userCertificate,
+                 byte[] userCertificateChain) {
+             Preconditions.checkCallAuthorization(isSystemUid(getCaller()), MSG_NOT_SYSTEM);
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return false;
++            }
+ 
+             final PrivateKey privateKey;
+             try {
+@@ -548,6 +618,10 @@ public class KeyChainService extends IntentService {
+                 throw new IllegalArgumentException("The alias specified for the key denotes "
+                         + "a reserved value and cannot be used to name a key");
+             }
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                throw new IllegalArgumentException(
++                        "The alias is reserved for an external KeyChain key");
++            }
+             if (!ALLOWED_UIDS.contains(uid)) {
+                 Log.e(TAG,
+                         String.format("Installing alias %s as UID %d is now allowed.", alias, uid));
+@@ -641,6 +715,15 @@ public class KeyChainService extends IntentService {
+         }
+ 
+         private boolean removeKeyPairInternal(String alias) {
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                if (!mExternalKeyManager.removeActiveIdentity(alias)) {
++                    return false;
++                }
++                mGrantsDb.removeAliasInformation(alias);
++                broadcastKeychainChange();
++                broadcastLegacyStorageChange();
++                return true;
++            }
+             try {
+                 mKeyStore.deleteEntry(alias);
+             } catch (KeyStoreException e) {
+@@ -658,6 +741,9 @@ public class KeyChainService extends IntentService {
+ 
+         @Override public boolean containsKeyPair(String alias) {
+             Preconditions.checkCallAuthorization(isSystemUid(getCaller()), MSG_NOT_SYSTEM);
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return mExternalKeyManager.containsActiveAlias(alias);
++            }
+             try {
+                 final Key key = mKeyStore.getKey(alias, null);
+                 return key instanceof PrivateKey;
+@@ -769,8 +855,14 @@ public class KeyChainService extends IntentService {
+ 
+         @Override public boolean setGrant(int uid, String alias, boolean granted) {
+             Preconditions.checkCallAuthorization(isSystemUid(getCaller()), MSG_NOT_SYSTEM);
++            final boolean isExternalAlias = ExternalKeyManager.isExternalAlias(alias);
++            if (isExternalAlias
++                    && granted
++                    && !mExternalKeyManager.containsActiveAlias(alias)) {
++                return false;
++            }
+             mGrantsDb.setGrant(uid, alias, granted);
+-            if (!granted) {
++            if (!granted && !isExternalAlias) {
+                 try {
+                     KeyStore2.getInstance().ungrant(makeKeyDescriptor(alias), uid);
+                 } catch (android.security.KeyStoreException e) {
+@@ -785,6 +877,9 @@ public class KeyChainService extends IntentService {
+ 
+         @Override public int[] getGrants(String alias) {
+             Preconditions.checkCallAuthorization(isSystemUid(getCaller()), MSG_NOT_SYSTEM);
++            if (ExternalKeyManager.isExternalAlias(alias)) {
++                return mGrantsDb.getGrants(alias);
++            }
+             try {
+                 if (mKeyStore.isKeyEntry(alias)) {
+                     return mGrantsDb.getGrants(alias);
+@@ -921,7 +1016,8 @@ public class KeyChainService extends IntentService {
+             }
+             // Check whether any of the aliases in the policy already exist
+             for (String alias : authenticationPolicy.getAliases()) {
+-                if (requestPrivateKey(alias) != null) {
++                if (mExternalKeyManager.containsActiveAlias(alias)
++                        || requestPrivateKey(alias) != null) {
+                     throw new IllegalArgumentException(String.format("The authentication policy "
+                             + "contains an installed alias: %s", alias));
+                 }
+@@ -1100,5 +1196,9 @@ public class KeyChainService extends IntentService {
+         public KeyStore getKeyStoreInstance() throws KeyStoreException {
+             return KeyStore.getInstance("AndroidKeyStore");
+         }
++
++        public ExternalKeyManager getExternalKeyManager(Context context) {
++            return ExternalKeyManager.unavailable();
++        }
+     }
+ }
+diff --git a/src/com/android/keychain/internal/GrantsDatabase.java b/src/com/android/keychain/internal/GrantsDatabase.java
+index 789ce6f..8dc63b3 100644
+--- a/src/com/android/keychain/internal/GrantsDatabase.java
++++ b/src/com/android/keychain/internal/GrantsDatabase.java
+@@ -261,6 +261,20 @@ public class GrantsDatabase {
+         db.replace(TABLE_SELECTABLE, null, values);
+     }
+ 
++    /** Adds the default selectable state without replacing an explicit policy decision. */
++    public void ensureIsUserSelectable(final String alias) {
++        final SQLiteDatabase db = mDatabaseHelper.getWritableDatabase();
++        final ContentValues values = new ContentValues();
++        values.put(GRANTS_ALIAS, alias);
++        values.put(SELECTABLE_IS_SELECTABLE, Boolean.toString(true));
++
++        db.insertWithOnConflict(
++                TABLE_SELECTABLE,
++                null,
++                values,
++                SQLiteDatabase.CONFLICT_IGNORE);
++    }
++
+     public boolean isUserSelectable(final String alias) {
+         final SQLiteDatabase db = mDatabaseHelper.getWritableDatabase();
+         try (Cursor res =
+diff --git a/tests/src/com/android/keychain/ExternalKeyManagerTest.java b/tests/src/com/android/keychain/ExternalKeyManagerTest.java
+new file mode 100644
+index 0000000..cc37498
+--- /dev/null
++++ b/tests/src/com/android/keychain/ExternalKeyManagerTest.java
+@@ -0,0 +1,485 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.keychain;
++
++import static com.google.common.truth.Truth.assertThat;
++
++import android.security.KeyChainExternalSignatureRequest;
++import android.security.KeyChainExternalSignatureResult;
++import android.security.KeyChainPrivateKeyDescriptor;
++import android.security.keystore.KeyProperties;
++
++import libcore.java.security.TestKeyStore;
++
++import org.junit.Test;
++
++import java.io.ByteArrayOutputStream;
++import java.security.KeyStore.PrivateKeyEntry;
++import java.security.cert.Certificate;
++import java.security.cert.CertificateEncodingException;
++import java.security.cert.CertificateException;
++import java.security.interfaces.RSAKey;
++import java.util.Arrays;
++
++public final class ExternalKeyManagerTest {
++    private static final long SYNTHETIC_PROVIDER_GENERATION = 7L;
++    private static final long STALE_PROVIDER_GENERATION = 6L;
++    private static final int SYNTHETIC_CALLER_UID = 12_345;
++    private static final String SYNTHETIC_CALLER_PACKAGE = "com.example.browser";
++    private static final String ALTERNATE_CALLER_PACKAGE = "com.example.browser.helper";
++    private static final byte SYNTHETIC_DIGEST_FILL = 0x5A;
++    private static final byte SYNTHETIC_SIGNATURE_FILL = 0x35;
++    private static final byte SYNTHETIC_SCALAR_FILL = 0x31;
++    private static final byte CLEARED_BYTE = 0;
++    private static final int LEAF_CERTIFICATE_INDEX = 0;
++    private static final int FIRST_CA_CERTIFICATE_INDEX = LEAF_CERTIFICATE_INDEX + 1;
++    private static final int P384_SCALAR_LENGTH_BITS = 384;
++    private static final int P384_SCALAR_LENGTH_BYTES = P384_SCALAR_LENGTH_BITS / Byte.SIZE;
++    private static final int DER_SEQUENCE_TAG = 0x30;
++    private static final int DER_INTEGER_TAG = 0x02;
++    private static final int DER_TAG_LENGTH_BYTES = 1;
++    private static final int DER_LENGTH_LENGTH_BYTES = 1;
++    private static final int DER_HEADER_LENGTH_BYTES =
++            DER_TAG_LENGTH_BYTES + DER_LENGTH_LENGTH_BYTES;
++    private static final int DER_FIRST_VALUE_OFFSET = DER_HEADER_LENGTH_BYTES;
++    private static final int DER_SHORT_FORM_LIMIT = 0x80;
++    private static final int DER_SIGN_BIT_MASK = 0x80;
++    private static final int EXTRA_TRAILING_LENGTH_BYTES = 1;
++    private static final int RSA_SIGNATURE_LENGTH_ROUNDING_BITS = Byte.SIZE - 1;
++    private static final int NO_SIGN_CALLS = 0;
++    private static final int FIRST_ARRAY_OFFSET = 0;
++    private static final long NO_PROVIDER_GENERATION = 0L;
++    private static final int TRUNCATED_CERTIFICATE_LENGTH_BYTES = 1;
++    private static final byte MALFORMED_CERTIFICATE_BYTE = 0x31;
++
++    @Test
++    public void identityDerivesItsKeyAndDefensivelyCopiesCertificates() throws Exception {
++        PrivateKeyEntry keyEntry = syntheticRsaKeyEntry();
++        byte[] leaf = keyEntry.getCertificate().getEncoded();
++        byte[] chain = encodeCaCertificates(keyEntry.getCertificateChain());
++
++        ExternalKeyIdentity identity =
++                ExternalKeyIdentity.create(leaf, chain, SYNTHETIC_PROVIDER_GENERATION);
++        Arrays.fill(leaf, CLEARED_BYTE);
++        if (chain != null) {
++            Arrays.fill(chain, CLEARED_BYTE);
++        }
++
++        assertThat(identity.getKeyAlgorithm()).isEqualTo(KeyProperties.KEY_ALGORITHM_RSA);
++        assertThat(identity.getProviderGeneration()).isEqualTo(SYNTHETIC_PROVIDER_GENERATION);
++        assertThat(identity.copyLeafCertificate())
++                .isEqualTo(keyEntry.getCertificate().getEncoded());
++        assertThat(identity.copyEncodedPublicKey())
++                .isEqualTo(keyEntry.getCertificate().getPublicKey().getEncoded());
++        assertThat(identity.toString()).doesNotContain("subject");
++    }
++
++    @Test
++    public void identityRejectsMalformedCertificatesAndNonpositiveGeneration() throws Exception {
++        PrivateKeyEntry keyEntry = syntheticRsaKeyEntry();
++        byte[] leaf = keyEntry.getCertificate().getEncoded();
++        byte[] truncated = Arrays.copyOf(leaf, leaf.length - TRUNCATED_CERTIFICATE_LENGTH_BYTES);
++        byte[] malformed = {MALFORMED_CERTIFICATE_BYTE};
++
++        assertIdentityRejected(truncated, null, SYNTHETIC_PROVIDER_GENERATION);
++        assertIdentityRejected(malformed, null, SYNTHETIC_PROVIDER_GENERATION);
++        assertIdentityRejected(leaf, malformed, SYNTHETIC_PROVIDER_GENERATION);
++        assertIdentityRejected(leaf, null, NO_PROVIDER_GENERATION);
++    }
++
++    @Test
++    public void unavailableProviderPublishesNothingAndFailsClosed() throws Exception {
++        ExternalKeyManager manager = ExternalKeyManager.unavailable();
++
++        assertThat(manager.getActiveAliases()).isEmpty();
++        assertThat(manager.getPrivateKeyDescriptor(ExternalKeyManager.KEYCHAIN_ALIAS)).isNull();
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++        } finally {
++            manager.close();
++        }
++    }
++
++    @Test
++    public void descriptorAndCertificatesUseOneValidatedSnapshot() throws Exception {
++        ExternalKeyIdentity identity = syntheticRsaIdentity();
++        FakeProvider provider = new FakeProvider(identity);
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++
++        KeyChainPrivateKeyDescriptor descriptor =
++                manager.getPrivateKeyDescriptor(ExternalKeyManager.KEYCHAIN_ALIAS);
++
++        assertThat(descriptor).isNotNull();
++        assertThat(descriptor.getType()).isEqualTo(KeyChainPrivateKeyDescriptor.TYPE_EXTERNAL_KEY);
++        assertThat(descriptor.getExternalAlias()).isEqualTo(ExternalKeyManager.KEYCHAIN_ALIAS);
++        assertThat(descriptor.getAlgorithm()).isEqualTo(identity.getKeyAlgorithm());
++        assertThat(descriptor.getEncodedPublicKey()).isEqualTo(identity.copyEncodedPublicKey());
++        assertThat(descriptor.getProviderGeneration()).isEqualTo(SYNTHETIC_PROVIDER_GENERATION);
++        assertThat(manager.getCertificate(ExternalKeyManager.KEYCHAIN_ALIAS))
++                .isEqualTo(identity.copyLeafCertificate());
++        assertThat(manager.getCaCertificates(ExternalKeyManager.KEYCHAIN_ALIAS))
++                .isEqualTo(identity.copyCaCertificates());
++    }
++
++    @Test
++    public void generationAndKeyAlgorithmAreCheckedBeforeProviderCall() throws Exception {
++        FakeProvider provider = new FakeProvider(syntheticRsaIdentity());
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++
++        try (KeyChainExternalSignatureRequest staleRequest =
++                        newRequest(
++                                STALE_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult staleResult =
++                        manager.sign(syntheticCaller(), staleRequest)) {
++            assertThat(staleResult.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_PROVIDER_GENERATION_CHANGED);
++        }
++        try (KeyChainExternalSignatureRequest wrongKeyRequest =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_ECDSA_P384_SHA256);
++                KeyChainExternalSignatureResult wrongKeyResult =
++                        manager.sign(syntheticCaller(), wrongKeyRequest)) {
++            assertThat(wrongKeyResult.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++        }
++
++        assertThat(provider.mSignCallCount).isEqualTo(NO_SIGN_CALLS);
++    }
++
++    @Test
++    public void closedAndInterruptedRequestsNeverReachProvider() throws Exception {
++        FakeProvider provider = new FakeProvider(syntheticRsaIdentity());
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++        KeyChainExternalSignatureRequest closedRequest =
++                newRequest(
++                        SYNTHETIC_PROVIDER_GENERATION,
++                        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++        closedRequest.close();
++
++        try (KeyChainExternalSignatureResult result =
++                manager.sign(syntheticCaller(), closedRequest)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++        }
++
++        Thread.currentThread().interrupt();
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_CALLER_INTERRUPTED);
++        } finally {
++            Thread.interrupted();
++        }
++        assertThat(provider.mSignCallCount).isEqualTo(NO_SIGN_CALLS);
++    }
++
++    @Test
++    public void validSignatureTransfersThroughTheCoarseBoundary() throws Exception {
++        ExternalKeyIdentity identity = syntheticRsaIdentity();
++        FakeProvider provider = new FakeProvider(identity);
++        byte[] signature = syntheticRsaSignature(identity);
++        provider.mNextResult = KeyChainExternalSignatureResult.success(signature);
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.isSuccess()).isTrue();
++            assertThat(result.copySignature()).isEqualTo(signature);
++            assertThat(provider.mObservedCaller.getUid()).isEqualTo(SYNTHETIC_CALLER_UID);
++            assertThat(provider.mObservedCaller.copyPackageNames())
++                    .asList()
++                    .containsExactly(SYNTHETIC_CALLER_PACKAGE);
++        } finally {
++            Arrays.fill(signature, CLEARED_BYTE);
++        }
++    }
++
++    @Test
++    public void malformedProviderOutputAndProviderCrashAreCoarseFailures() throws Exception {
++        ExternalKeyIdentity identity = syntheticRsaIdentity();
++        FakeProvider provider = new FakeProvider(identity);
++        byte[] shortSignature =
++                new byte[syntheticRsaSignatureLength(identity) - EXTRA_TRAILING_LENGTH_BYTES];
++        provider.mNextResult = KeyChainExternalSignatureResult.success(shortSignature);
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_SIGNING_FAILED);
++        } finally {
++            Arrays.fill(shortSignature, CLEARED_BYTE);
++        }
++
++        provider.mThrowDuringSign = true;
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR);
++        }
++
++        provider.mThrowDuringSign = false;
++        provider.mThrowAssertionDuringSign = true;
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR);
++        }
++    }
++
++    @Test
++    public void providerFailureIsTransferredWithoutInternalDetails() throws Exception {
++        FakeProvider provider = new FakeProvider(syntheticRsaIdentity());
++        provider.mNextResult =
++                KeyChainExternalSignatureResult.failure(
++                        KeyChainExternalSignatureResult.FAILURE_USER_CANCELLED);
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++
++        try (KeyChainExternalSignatureRequest request =
++                        newRequest(
++                                SYNTHETIC_PROVIDER_GENERATION,
++                                KeyChainExternalSignatureRequest
++                                        .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                KeyChainExternalSignatureResult result = manager.sign(syntheticCaller(), request)) {
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_USER_CANCELLED);
++            assertThat(result.toString()).doesNotContain(ExternalKeyManager.KEYCHAIN_ALIAS);
++        }
++    }
++
++    @Test
++    public void removeRequiresTheExactGenerationToDisappear() throws Exception {
++        FakeProvider provider = new FakeProvider(syntheticRsaIdentity());
++        ExternalKeyManager manager = new ExternalKeyManager(provider);
++
++        assertThat(manager.removeActiveIdentity(ExternalKeyManager.KEYCHAIN_ALIAS)).isTrue();
++        assertThat(provider.mRemovedGeneration).isEqualTo(SYNTHETIC_PROVIDER_GENERATION);
++        assertThat(manager.containsActiveAlias(ExternalKeyManager.KEYCHAIN_ALIAS)).isFalse();
++    }
++
++    @Test
++    public void callerSortsAndDefensivelyCopiesPackages() {
++        String[] packages = {ALTERNATE_CALLER_PACKAGE, SYNTHETIC_CALLER_PACKAGE};
++        ExternalKeyCaller caller = new ExternalKeyCaller(SYNTHETIC_CALLER_UID, packages);
++        Arrays.fill(packages, SYNTHETIC_CALLER_PACKAGE);
++
++        String[] observedPackages = caller.copyPackageNames();
++        assertThat(observedPackages)
++                .asList()
++                .containsExactly(SYNTHETIC_CALLER_PACKAGE, ALTERNATE_CALLER_PACKAGE)
++                .inOrder();
++        Arrays.fill(observedPackages, SYNTHETIC_CALLER_PACKAGE);
++        assertThat(caller.copyPackageNames())
++                .asList()
++                .containsExactly(SYNTHETIC_CALLER_PACKAGE, ALTERNATE_CALLER_PACKAGE)
++                .inOrder();
++        assertThat(caller.toString()).doesNotContain(SYNTHETIC_CALLER_PACKAGE);
++        assertThat(caller.toString()).doesNotContain(ALTERNATE_CALLER_PACKAGE);
++    }
++
++    @Test
++    public void p384EcdsaShapeRequiresCanonicalPositiveDerIntegers() {
++        byte[] canonical = syntheticP384EcdsaSignature();
++        assertThat(ExternalKeyManager.isCanonicalP384EcdsaSignature(canonical)).isTrue();
++
++        byte[] negative = canonical.clone();
++        negative[firstScalarOffset()] = (byte) DER_SIGN_BIT_MASK;
++        assertThat(ExternalKeyManager.isCanonicalP384EcdsaSignature(negative)).isFalse();
++
++        byte[] longForm = canonical.clone();
++        longForm[DER_TAG_LENGTH_BYTES] = (byte) DER_SHORT_FORM_LIMIT;
++        assertThat(ExternalKeyManager.isCanonicalP384EcdsaSignature(longForm)).isFalse();
++
++        byte[] trailing = Arrays.copyOf(canonical, canonical.length + EXTRA_TRAILING_LENGTH_BYTES);
++        assertThat(ExternalKeyManager.isCanonicalP384EcdsaSignature(trailing)).isFalse();
++    }
++
++    private static ExternalKeyCaller syntheticCaller() {
++        return new ExternalKeyCaller(SYNTHETIC_CALLER_UID, new String[] {SYNTHETIC_CALLER_PACKAGE});
++    }
++
++    private static KeyChainExternalSignatureRequest newRequest(
++            long generation, @KeyChainExternalSignatureRequest.SignatureAlgorithm int algorithm) {
++        byte[] digest = new byte[KeyChainExternalSignatureRequest.getDigestLengthBytes(algorithm)];
++        Arrays.fill(digest, SYNTHETIC_DIGEST_FILL);
++        try {
++            return KeyChainExternalSignatureRequest.create(
++                    ExternalKeyManager.KEYCHAIN_ALIAS, algorithm, digest, generation);
++        } finally {
++            Arrays.fill(digest, CLEARED_BYTE);
++        }
++    }
++
++    private static PrivateKeyEntry syntheticRsaKeyEntry() {
++        return TestKeyStore.getClientCertificate()
++                .getPrivateKey(KeyProperties.KEY_ALGORITHM_RSA, KeyProperties.KEY_ALGORITHM_RSA);
++    }
++
++    private static ExternalKeyIdentity syntheticRsaIdentity() throws CertificateException {
++        PrivateKeyEntry keyEntry = syntheticRsaKeyEntry();
++        try {
++            return ExternalKeyIdentity.create(
++                    keyEntry.getCertificate().getEncoded(),
++                    encodeCaCertificates(keyEntry.getCertificateChain()),
++                    SYNTHETIC_PROVIDER_GENERATION);
++        } catch (CertificateEncodingException exception) {
++            throw new CertificateException(
++                    "Synthetic leaf certificate cannot be encoded", exception);
++        }
++    }
++
++    private static void assertIdentityRejected(byte[] leaf, byte[] chain, long providerGeneration) {
++        try {
++            ExternalKeyIdentity.create(leaf, chain, providerGeneration);
++            throw new AssertionError("Malformed external identity was accepted");
++        } catch (CertificateException | IllegalArgumentException expected) {
++            // Exact parse details do not cross the provider boundary.
++        }
++    }
++
++    private static byte[] encodeCaCertificates(Certificate[] chain)
++            throws CertificateEncodingException {
++        if (chain.length <= FIRST_CA_CERTIFICATE_INDEX) {
++            return null;
++        }
++        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
++        for (int index = FIRST_CA_CERTIFICATE_INDEX; index < chain.length; index++) {
++            byte[] certificate = chain[index].getEncoded();
++            encoded.write(certificate, FIRST_ARRAY_OFFSET, certificate.length);
++        }
++        return encoded.toByteArray();
++    }
++
++    private static byte[] syntheticRsaSignature(ExternalKeyIdentity identity) {
++        byte[] signature = new byte[syntheticRsaSignatureLength(identity)];
++        Arrays.fill(signature, SYNTHETIC_SIGNATURE_FILL);
++        return signature;
++    }
++
++    private static int syntheticRsaSignatureLength(ExternalKeyIdentity identity) {
++        int modulusLengthBits = ((RSAKey) identity.getPublicKey()).getModulus().bitLength();
++        return (modulusLengthBits + RSA_SIGNATURE_LENGTH_ROUNDING_BITS) / Byte.SIZE;
++    }
++
++    private static byte[] syntheticP384EcdsaSignature() {
++        byte[] scalar = new byte[P384_SCALAR_LENGTH_BYTES];
++        Arrays.fill(scalar, SYNTHETIC_SCALAR_FILL);
++        int integerLength = DER_HEADER_LENGTH_BYTES + scalar.length;
++        int sequenceLength = integerLength + integerLength;
++        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
++        encoded.write(DER_SEQUENCE_TAG);
++        encoded.write(sequenceLength);
++        writeDerInteger(encoded, scalar);
++        writeDerInteger(encoded, scalar);
++        Arrays.fill(scalar, CLEARED_BYTE);
++        return encoded.toByteArray();
++    }
++
++    private static void writeDerInteger(ByteArrayOutputStream destination, byte[] scalar) {
++        destination.write(DER_INTEGER_TAG);
++        destination.write(scalar.length);
++        destination.write(scalar, FIRST_ARRAY_OFFSET, scalar.length);
++    }
++
++    private static int firstScalarOffset() {
++        return DER_FIRST_VALUE_OFFSET + DER_HEADER_LENGTH_BYTES;
++    }
++
++    private static final class FakeProvider implements ExternalKeyProvider {
++        private ExternalKeyIdentity mIdentity;
++        private KeyChainExternalSignatureResult mNextResult;
++        private ExternalKeyCaller mObservedCaller;
++        private int mSignCallCount;
++        private long mRemovedGeneration;
++        private boolean mThrowDuringSign;
++        private boolean mThrowAssertionDuringSign;
++
++        FakeProvider(ExternalKeyIdentity identity) {
++            mIdentity = identity;
++        }
++
++        @Override
++        public ExternalKeyIdentity getActiveIdentity() {
++            return mIdentity;
++        }
++
++        @Override
++        public KeyChainExternalSignatureResult sign(
++                ExternalKeyCaller caller, KeyChainExternalSignatureRequest request) {
++            mSignCallCount++;
++            mObservedCaller = caller;
++            if (mThrowDuringSign) {
++                throw new IllegalStateException("synthetic provider failure");
++            }
++            if (mThrowAssertionDuringSign) {
++                throw new AssertionError("synthetic provider assertion");
++            }
++            KeyChainExternalSignatureResult result = mNextResult;
++            mNextResult = null;
++            return result;
++        }
++
++        @Override
++        public boolean removeIdentity(long providerGeneration) {
++            if (mIdentity == null || mIdentity.getProviderGeneration() != providerGeneration) {
++                return false;
++            }
++            mRemovedGeneration = providerGeneration;
++            mIdentity = null;
++            return true;
++        }
++
++        @Override
++        public void close() {
++            mIdentity = null;
++            if (mNextResult != null) {
++                mNextResult.close();
++                mNextResult = null;
++            }
++        }
++    }
++}
+diff --git a/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java b/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java
+index 4739290..22a5a71 100644
+--- a/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java
++++ b/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java
+@@ -69,7 +69,7 @@ public class BasicKeyChainServiceTest {
+     private static final String ALIAS_GENERATED = "generated";
+     public static final byte[] DUMMY_CHALLENGE = {'a', 'b', 'c'};
+     private static final String ALIAS_NON_EXISTING = "nonexisting";
+-    private static final String SYNTHETIC_EXTERNAL_ALIAS = "synthetic-external-alias";
++    private static final String SYNTHETIC_UNKNOWN_EXTERNAL_ALIAS = "synthetic-external-alias";
+     private static final long SYNTHETIC_PROVIDER_GENERATION = 7L;
+     private static final byte SYNTHETIC_DIGEST_FILL = 'd';
+     private static final byte CLEARED_BYTE = 0;
+@@ -177,7 +177,7 @@ public class BasicKeyChainServiceTest {
+     }
+ 
+     @Test
+-    public void testExternalSignatureFailsClosedBeforeProviderIntegration() throws RemoteException {
++    public void testExternalSignatureRejectsUnknownAlias() throws RemoteException {
+         int algorithm =
+                 KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256;
+         byte[] digest =
+@@ -186,7 +186,7 @@ public class BasicKeyChainServiceTest {
+ 
+         try (KeyChainExternalSignatureRequest request =
+                         KeyChainExternalSignatureRequest.create(
+-                                SYNTHETIC_EXTERNAL_ALIAS,
++                                SYNTHETIC_UNKNOWN_EXTERNAL_ALIAS,
+                                 algorithm,
+                                 digest,
+                                 SYNTHETIC_PROVIDER_GENERATION);
+@@ -196,7 +196,7 @@ public class BasicKeyChainServiceTest {
+             assertThat(result.isSuccess()).isFalse();
+             assertThat(result.getFailure())
+                     .isEqualTo(
+-                            KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++                            KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
+         } finally {
+             Arrays.fill(digest, CLEARED_BYTE);
+         }
+@@ -212,6 +212,11 @@ public class BasicKeyChainServiceTest {
+         }
+     }
+ 
++    @Test
++    public void testNoExternalAliasBeforeTrustedProviderBinding() throws RemoteException {
++        assertThat(mKeyChainService.getExternalKeyAliases().getList()).isEmpty();
++    }
++
+     @Test
+     public void testInstallAndRemoveKeyPair()
+             throws RemoteException, IOException, CertificateException {
+-- 
+2.50.1 (Apple Git-155)
+

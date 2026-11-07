@@ -1,0 +1,4 @@
+# RefineID has no production network domain. Android's app domain supplies the
+# USB file-descriptor access granted through UsbManager.
+type refineid_app, domain, coredomain;
+app_domain(refineid_app)

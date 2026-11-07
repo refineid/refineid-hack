@@ -1,0 +1,25 @@
+package {
+    default_applicable_licenses: ["RefineID_license"],
+}
+
+license {
+    name: "RefineID_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-Apache-2.0"],
+    license_text: ["LICENSE"],
+}
+
+// AOSP signs this unsigned release artifact with its build-local platform key.
+android_app_import {
+    name: "RefineID",
+    apk: "aosp-prebuilt/RefineID.apk",
+    certificate: "platform",
+    dex_preopt: {
+        enabled: false,
+    },
+    // Gradle adds optional AndroidX compatibility libraries to the manifest.
+    // Android safely ignores them when this Android 13 product omits them.
+    enforce_uses_libs: false,
+    privileged: true,
+    product_specific: true,
+}

@@ -1,0 +1,381 @@
+From 08a04bef028a1c67a81ec0705b05dea456bb5d45 Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 16:18:27 +0300
+Subject: [PATCH 4/4] Include external keys in KeyChain chooser
+
+---
+ .../android/keychain/KeyChainActivity.java    | 172 ++++++++++++++++--
+ .../keychain/tests/KeyChainActivityTest.java  |  57 ++++++
+ 2 files changed, 216 insertions(+), 13 deletions(-)
+
+diff --git a/src/com/android/keychain/KeyChainActivity.java b/src/com/android/keychain/KeyChainActivity.java
+index 54e7d3a..88a1100 100644
+--- a/src/com/android/keychain/KeyChainActivity.java
++++ b/src/com/android/keychain/KeyChainActivity.java
+@@ -28,6 +28,7 @@ import android.content.Context;
+ import android.content.DialogInterface;
+ import android.content.Intent;
+ import android.content.pm.PackageManager;
++import android.content.pm.StringParceledListSlice;
+ import android.content.pm.UserInfo;
+ import android.content.res.Resources;
+ import android.net.Uri;
+@@ -41,6 +42,7 @@ import android.os.ServiceManager;
+ import android.os.UserManager;
+ import android.security.IKeyChainAliasCallback;
+ import android.security.KeyChain;
++import android.security.KeyChainException;
+ import android.stats.devicepolicy.DevicePolicyEnums;
+ import android.util.Log;
+ import android.view.LayoutInflater;
+@@ -72,7 +74,11 @@ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Enumeration;
++import java.util.HashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+@@ -232,8 +238,13 @@ public class KeyChainActivity extends AppCompatActivity {
+             Log.i(TAG, "Issuers specified, will be listed later.");
+         }
+ 
+-        final AliasLoader loader = new AliasLoader(mKeyStore, this, keyInfoProvider,
+-                new CertificateParametersFilter(mKeyStore, keyTypes, issuers));
++        final CertificateSource certificateSource = new KeyChainCertificateSource(this);
++        final AliasLoader loader = new AliasLoader(
++                mKeyStore,
++                this,
++                keyInfoProvider,
++                certificateSource,
++                new CertificateParametersFilter(certificateSource, keyTypes, issuers));
+         loader.execute();
+ 
+         final IKeyChainAliasCallback.Stub callback = new IKeyChainAliasCallback.Stub() {
+@@ -360,14 +371,104 @@ public class KeyChainActivity extends AppCompatActivity {
+     }
+ 
+     @VisibleForTesting
+-    public static class CertificateParametersFilter {
++    public interface CertificateSource {
++        @Nullable
++        X509Certificate getLeafCertificate(String alias);
++
++        @NonNull
++        List<X509Certificate> getCaCertificates(String alias);
++    }
++
++    private static final class KeyStoreCertificateSource implements CertificateSource {
+         private final KeyStore mKeyStore;
++
++        KeyStoreCertificateSource(KeyStore keyStore) {
++            mKeyStore = keyStore;
++        }
++
++        @Override
++        @Nullable
++        public X509Certificate getLeafCertificate(String alias) {
++            return loadCertificate(mKeyStore, alias);
++        }
++
++        @Override
++        @NonNull
++        public List<X509Certificate> getCaCertificates(String alias) {
++            return loadCertificateChain(mKeyStore, alias);
++        }
++    }
++
++    private static final class KeyChainCertificateSource implements CertificateSource {
++        private static final int LEAF_CERTIFICATE_INDEX = 0;
++        private static final int FIRST_CA_CERTIFICATE_INDEX = LEAF_CERTIFICATE_INDEX + 1;
++        private static final int NO_CERTIFICATES = 0;
++
++        private final Context mContext;
++        private final Map<String, List<X509Certificate>> mCertificateChains = new HashMap<>();
++
++        KeyChainCertificateSource(Context context) {
++            mContext = context.getApplicationContext();
++        }
++
++        @Override
++        @Nullable
++        public X509Certificate getLeafCertificate(String alias) {
++            List<X509Certificate> chain = getCertificateChain(alias);
++            return chain.isEmpty() ? null : chain.get(LEAF_CERTIFICATE_INDEX);
++        }
++
++        @Override
++        @NonNull
++        public List<X509Certificate> getCaCertificates(String alias) {
++            List<X509Certificate> chain = getCertificateChain(alias);
++            if (chain.size() <= FIRST_CA_CERTIFICATE_INDEX) {
++                return Collections.emptyList();
++            }
++            return new ArrayList<>(
++                    chain.subList(FIRST_CA_CERTIFICATE_INDEX, chain.size()));
++        }
++
++        @NonNull
++        private synchronized List<X509Certificate> getCertificateChain(String alias) {
++            List<X509Certificate> cached = mCertificateChains.get(alias);
++            if (cached != null) {
++                return cached;
++            }
++            try {
++                X509Certificate[] chain = KeyChain.getCertificateChain(mContext, alias);
++                if (chain == null || chain.length == NO_CERTIFICATES) {
++                    List<X509Certificate> absent = Collections.emptyList();
++                    mCertificateChains.put(alias, absent);
++                    return absent;
++                }
++                List<X509Certificate> loaded = Collections.unmodifiableList(
++                        new ArrayList<>(Arrays.asList(chain)));
++                mCertificateChains.put(alias, loaded);
++                return loaded;
++            } catch (InterruptedException exception) {
++                Thread.currentThread().interrupt();
++                return Collections.emptyList();
++            } catch (KeyChainException | RuntimeException exception) {
++                return Collections.emptyList();
++            }
++        }
++    }
++
++    @VisibleForTesting
++    public static class CertificateParametersFilter {
++        private final CertificateSource mCertificateSource;
+         private final List<String> mKeyTypes;
+         private final List<X500Principal> mIssuers;
+ 
+         public CertificateParametersFilter(KeyStore keyStore,
+                 @NonNull String[] keyTypes, @NonNull ArrayList<byte[]> issuers) {
+-            mKeyStore = keyStore;
++            this(new KeyStoreCertificateSource(keyStore), keyTypes, issuers);
++        }
++
++        public CertificateParametersFilter(CertificateSource certificateSource,
++                @NonNull String[] keyTypes, @NonNull ArrayList<byte[]> issuers) {
++            mCertificateSource = certificateSource;
+             mKeyTypes = Arrays.asList(keyTypes);
+             mIssuers = new ArrayList<X500Principal>();
+             for (byte[] issuer : issuers) {
+@@ -382,13 +483,14 @@ public class KeyChainActivity extends AppCompatActivity {
+         }
+ 
+         public boolean shouldPresentCertificate(String alias) {
+-            X509Certificate cert = loadCertificate(mKeyStore, alias);
++            X509Certificate cert = mCertificateSource.getLeafCertificate(alias);
+             // If there's no certificate associated with the alias, skip.
+             if (cert == null) {
+                 Log.i(TAG, String.format("No certificate associated with alias %s", alias));
+                 return false;
+             }
+-            List<X509Certificate> certChain = new ArrayList(loadCertificateChain(mKeyStore, alias));
++            List<X509Certificate> certChain =
++                    new ArrayList<>(mCertificateSource.getCaCertificates(alias));
+             Log.i(TAG, String.format("Inspecting certificate %s aliased with %s, chain length %d",
+                         cert.getSubjectDN().getName(), alias, certChain.size()));
+ 
+@@ -433,18 +535,59 @@ public class KeyChainActivity extends AppCompatActivity {
+         }
+     }
+ 
++    @NonNull
++    private static List<String> loadExternalAliases(Context context) {
++        try (KeyChain.KeyChainConnection connection =
++                KeyChain.bind(context.getApplicationContext())) {
++            StringParceledListSlice aliases =
++                    connection.getService().getExternalKeyAliases();
++            if (aliases == null || aliases.getList() == null) {
++                return Collections.emptyList();
++            }
++            return new ArrayList<>(aliases.getList());
++        } catch (InterruptedException exception) {
++            Thread.currentThread().interrupt();
++            return Collections.emptyList();
++        } catch (RemoteException | RuntimeException exception) {
++            return Collections.emptyList();
++        }
++    }
++
++    @VisibleForTesting
++    @NonNull
++    public static List<String> mergeAliases(
++            @NonNull List<String> keyStoreAliases,
++            @NonNull List<String> externalAliases) {
++        Set<String> merged = new LinkedHashSet<>();
++        addValidAliases(merged, keyStoreAliases);
++        addValidAliases(merged, externalAliases);
++        return new ArrayList<>(merged);
++    }
++
++    private static void addValidAliases(
++            @NonNull Set<String> destination, @NonNull List<String> aliases) {
++        for (String alias : aliases) {
++            if (alias != null && !alias.isEmpty()) {
++                destination.add(alias);
++            }
++        }
++    }
++
+     @VisibleForTesting
+     static class AliasLoader extends AsyncTask<Void, Void, CertificateAdapter> {
+         private final KeyStore mKeyStore;
+         private final Context mContext;
+         private final KeyInfoProvider mInfoProvider;
++        private final CertificateSource mCertificateSource;
+         private final CertificateParametersFilter mCertificateFilter;
+ 
+         public AliasLoader(KeyStore keyStore, Context context,
+-                KeyInfoProvider infoProvider, CertificateParametersFilter certificateFilter) {
++                KeyInfoProvider infoProvider, CertificateSource certificateSource,
++                CertificateParametersFilter certificateFilter) {
+           mKeyStore = keyStore;
+           mContext = context;
+           mInfoProvider = infoProvider;
++          mCertificateSource = certificateSource;
+           mCertificateFilter = certificateFilter;
+         }
+ 
+@@ -463,8 +606,10 @@ public class KeyChainActivity extends AppCompatActivity {
+                         + "List may be empty or incomplete.");
+             }
+ 
+-            return new CertificateAdapter(mKeyStore, mContext,
+-                    rawAliasList.stream().filter(mInfoProvider::isUserSelectable)
++            final List<String> aliases =
++                    mergeAliases(rawAliasList, loadExternalAliases(mContext));
++            return new CertificateAdapter(mCertificateSource, mContext,
++                    aliases.stream().filter(mInfoProvider::isUserSelectable)
+                     .filter(mCertificateFilter::shouldPresentCertificate)
+                     .sorted().collect(Collectors.toList()));
+         }
+@@ -587,13 +732,14 @@ public class KeyChainActivity extends AppCompatActivity {
+     static class CertificateAdapter extends BaseAdapter {
+         private final List<String> mAliases;
+         private final List<String> mSubjects = new ArrayList<String>();
+-        private final KeyStore mKeyStore;
++        private final CertificateSource mCertificateSource;
+         private final Context mContext;
+ 
+-        private CertificateAdapter(KeyStore keyStore, Context context, List<String> aliases) {
++        private CertificateAdapter(
++                CertificateSource certificateSource, Context context, List<String> aliases) {
+             mAliases = aliases;
+             mSubjects.addAll(Collections.nCopies(aliases.size(), (String) null));
+-            mKeyStore = keyStore;
++            mCertificateSource = certificateSource;
+             mContext = context;
+         }
+         @Override public int getCount() {
+@@ -653,7 +799,7 @@ public class KeyChainActivity extends AppCompatActivity {
+             }
+             @Override protected String doInBackground(Void... params) {
+                 String alias = mAliases.get(mAdapterPosition);
+-                X509Certificate cert = loadCertificate(mKeyStore, alias);
++                X509Certificate cert = mCertificateSource.getLeafCertificate(alias);
+                 if (cert == null) {
+                     return null;
+                 }
+diff --git a/tests/src/com/android/keychain/tests/KeyChainActivityTest.java b/tests/src/com/android/keychain/tests/KeyChainActivityTest.java
+index 9acb6de..ba9b34a 100644
+--- a/tests/src/com/android/keychain/tests/KeyChainActivityTest.java
++++ b/tests/src/com/android/keychain/tests/KeyChainActivityTest.java
+@@ -17,12 +17,15 @@
+ package com.android.keychain.tests;
+ 
+ import static com.android.keychain.KeyChainActivity.CertificateParametersFilter;
++import static com.android.keychain.KeyChainActivity.CertificateSource;
++import static com.android.keychain.KeyChainActivity.mergeAliases;
+ 
+ import static com.google.common.truth.Truth.assertThat;
+ 
+ import static org.junit.Assert.fail;
+ 
+ import android.platform.test.annotations.LargeTest;
++import android.security.keystore.KeyProperties;
+ import android.util.Base64;
+ 
+ import androidx.test.runner.AndroidJUnit4;
+@@ -48,6 +51,8 @@ import java.security.spec.InvalidKeySpecException;
+ import java.security.spec.PKCS8EncodedKeySpec;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
+ import java.util.concurrent.CancellationException;
+ 
+ import javax.security.auth.x500.X500Principal;
+@@ -55,6 +60,11 @@ import javax.security.auth.x500.X500Principal;
+ @LargeTest
+ @RunWith(AndroidJUnit4.class)
+ public final class KeyChainActivityTest {
++    private static final String SYNTHETIC_KEYSTORE_ALIAS = "synthetic-keystore";
++    private static final String SYNTHETIC_EXTERNAL_ALIAS = "synthetic-external";
++    private static final String SYNTHETIC_DUPLICATE_ALIAS = "synthetic-duplicate";
++    private static final String EMPTY_ALIAS = "";
++
+     // Generated with:
+     // openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 3650
+     //   -out root_ca_certificate.pem
+@@ -205,6 +215,53 @@ public final class KeyChainActivityTest {
+                 .shouldPresentCertificate("testCertificateParametersFilter_client")).isFalse();
+     }
+ 
++    @Test
++    public void testCertificateParametersFilter_readsExternalCertificateSource() {
++        final X509Certificate leaf = parseCertificate(mLeafRsaCertificate);
++        final List<X509Certificate> chain = Arrays.asList(
++                parseCertificate(mIntermediateRsaCertificate),
++                parseCertificate(mRootRsaCertificate));
++        CertificateSource source = new CertificateSource() {
++            @Override
++            public X509Certificate getLeafCertificate(String alias) {
++                return SYNTHETIC_EXTERNAL_ALIAS.equals(alias) ? leaf : null;
++            }
++
++            @Override
++            public List<X509Certificate> getCaCertificates(String alias) {
++                return SYNTHETIC_EXTERNAL_ALIAS.equals(alias)
++                        ? chain
++                        : Collections.emptyList();
++            }
++        };
++        CertificateParametersFilter filter = new CertificateParametersFilter(
++                source,
++                new String[] {KeyProperties.KEY_ALGORITHM_RSA},
++                new ArrayList<byte[]>(
++                        Arrays.asList(INTERMEDIATE_SUBJECT.getEncoded())));
++
++        assertThat(filter.shouldPresentCertificate(SYNTHETIC_EXTERNAL_ALIAS)).isTrue();
++        assertThat(filter.shouldPresentCertificate(SYNTHETIC_KEYSTORE_ALIAS)).isFalse();
++    }
++
++    @Test
++    public void testMergeAliases_deduplicatesAndRejectsEmptyValues() {
++        List<String> merged = mergeAliases(
++                Arrays.asList(SYNTHETIC_KEYSTORE_ALIAS, SYNTHETIC_DUPLICATE_ALIAS),
++                Arrays.asList(
++                        SYNTHETIC_DUPLICATE_ALIAS,
++                        SYNTHETIC_EXTERNAL_ALIAS,
++                        EMPTY_ALIAS,
++                        null));
++
++        assertThat(merged)
++                .containsExactly(
++                        SYNTHETIC_KEYSTORE_ALIAS,
++                        SYNTHETIC_DUPLICATE_ALIAS,
++                        SYNTHETIC_EXTERNAL_ALIAS)
++                .inOrder();
++    }
++
+     // Return a KeyStore instance that has both a client certificate as well as a certificate
+     // chain associated with it.
+     private KeyStore prepareKeyStoreWithLongChainCertificates()
+-- 
+2.50.1 (Apple Git-155)
+
