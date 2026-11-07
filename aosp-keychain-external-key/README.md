@@ -8,6 +8,14 @@ from its commit `e41ecd4a3d9371e9be206a868519f838fbcd5de9`. It works only on a
 custom Pixel 4 image built from these patches and has nothing to do with the
 RefineID app in the store. It is unmaintained unless someone picks it up.
 
+The application half of the experiment, the provider service the patched
+KeyChain binds to with its PIN prompt, replay lease, transport sessions,
+AIDL copy, manifest entries and tests, left the RefineID app later the same
+day and sits in [`app-provider/`](app-provider/README.md) at its original
+app-module paths. The staging and verification scripts below expect it in
+the app they build, so graft it back into a refineid-android checkout before
+staging a prebuilt.
+
 This directory carries the RefineID AOSP patch series for the Pixel 4 build
 `TP1A.221005.002.B2`, which maps to the AOSP tag `android-13.0.0_r31`.
 

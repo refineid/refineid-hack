@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Manifest entries the RefineID app carried for the KeyChain external-key
+  provider. They are not a complete manifest: merge each block into the
+  app's AndroidManifest.xml at the place named in the comment above it.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Among the uses-permission elements, after HIDE_OVERLAY_WINDOWS. -->
+    <!-- Product images sign this APK with the platform key; see ADR 0027. -->
+    <uses-permission
+        android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND"
+        tools:ignore="ProtectedPermissions" />
+
+    <application>
+        <!-- First children of <application>, before MainActivity. -->
+        <!-- The PIN prompt takes the orientation of the browser beneath it (design record 0045). -->
+        <activity
+            android:name=".keychain.ExternalKeyPinActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:finishOnTaskLaunch="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="behind"
+            tools:ignore="DiscouragedApi,LockedOrientationActivity" />
+
+        <service
+            android:name=".keychain.ExternalKeyProviderService"
+            android:exported="true"
+            android:permission="com.android.keychain.permission.BIND_EXTERNAL_KEY_PROVIDER">
+            <intent-filter>
+                <action android:name="com.android.keychain.external.IExternalKeyProviderService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>
