@@ -7,6 +7,9 @@ not maintained to the standard of the RefineID applications. Read
 `aosp-keychain-external-key/` is the parked AOSP KeyChain patch series moved
 from refineid-android; its own README says what it is and what it needs.
 
+`konqueror-bridge/` is a local proxy that does TLS client authentication with a
+card for Konqueror on FreeBSD; see its README.
+
 `fetch_suomi_occupation.sh` implements a self-contained suomi.fi login chain over an
 SSHed host and fetches `value.profession` from the authenticated personal-data API.
 

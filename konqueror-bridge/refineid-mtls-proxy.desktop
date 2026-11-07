@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=RefineID mTLS Proxy
+Exec=/usr/local/bin/refineid-mtls-proxy
+OnlyShowIn=KDE;
+NoDisplay=true
