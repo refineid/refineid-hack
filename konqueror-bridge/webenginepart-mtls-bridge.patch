@@ -1,0 +1,66 @@
+--- webenginepart/src/webenginepart.cpp.orig
++++ webenginepart/src/webenginepart.cpp
+@@ -20,6 +20,11 @@
+ #include <QWebEngineSettings>
+ #include <QWebEngineProfile>
+ #include <QUrlQuery>
++#include <QFile>
++#include <QNetworkProxy>
++#include <QStandardPaths>
++#include <QHostAddress>
++#include <QTcpSocket>
+ 
+ #include "webenginepart_ext.h"
+ #include "webengineview.h"
+@@ -86,7 +91,42 @@
+ #include <QWebEngineHistory>
+ 
+ using namespace WebEngine;
++
++namespace {
++
++// The RefineID card bridge: konqueror-bridge in refineid-hack.
++QByteArray bridgeFile(const char *name)
++{
++    QFile file(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
++               + QStringLiteral("/refineid/bridge/") + QLatin1String(name));
++    return file.open(QIODevice::ReadOnly) ? file.readAll().trimmed() : QByteArray();
++}
++
++// Runs when the plugin loads, before QtWebEngine reads its flags.
++void trustBridgeKey()
++{
++    const QByteArray pin = bridgeFile("spki-sha256.base64");
++    if (!pin.isEmpty()) {
++        QByteArray flags = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
++        flags.append(" --ignore-certificate-errors-spki-list=").append(pin);
++        qputenv("QTWEBENGINE_CHROMIUM_FLAGS", flags);
++    }
++}
++Q_CONSTRUCTOR_FUNCTION(trustBridgeKey)
++
++void useBridgeIfRunning()
++{
++    const QByteArray secret = bridgeFile("proxy-secret");
++    QTcpSocket probe;
++    probe.connectToHost(QHostAddress::LocalHost, 18443);
++    if (!secret.isEmpty() && probe.waitForConnected(50)) {
++        QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::HttpProxy, QStringLiteral("127.0.0.1"), 18443,
++                                                         QStringLiteral("refineid"), QString::fromLatin1(secret)));
++    }
++}
+ 
++}
++
+ WebEnginePart::WebEnginePart(QWidget *parentWidget, QObject *parent,
+                          const KPluginMetaData& metaData,
+                          const QByteArray& cachedHistory, const QStringList& /*args*/)
+@@ -151,6 +191,8 @@
+ 
+     // Load plugins once we are fully ready
+     setWallet(new WebEngineWallet(this, parentWidget ? parentWidget->window()->winId() : 0));
++
++    useBridgeIfRunning();
+ 
+     setPage(page());
+ }
