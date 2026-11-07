@@ -1,0 +1,2 @@
+# Platform-signed product priv-app with a regular application UID.
+user=_app seinfo=platform isPrivApp=true name=fi.refineid.android domain=refineid_app type=privapp_data_file levelFrom=user

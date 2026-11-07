@@ -1,0 +1,118 @@
+From e21c13e2b048a99eee0b510c1170bded91f518ca Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 15:24:06 +0300
+Subject: [PATCH 2/2] Fail closed before external signing integration
+
+---
+ src/com/android/keychain/KeyChainService.java | 14 ++++++
+ .../tests/BasicKeyChainServiceTest.java       | 44 +++++++++++++++++++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/src/com/android/keychain/KeyChainService.java b/src/com/android/keychain/KeyChainService.java
+index 80bbc66..bbd3ab5 100644
+--- a/src/com/android/keychain/KeyChainService.java
++++ b/src/com/android/keychain/KeyChainService.java
+@@ -43,6 +43,8 @@ import android.security.AppUriAuthenticationPolicy;
+ import android.security.CredentialManagementApp;
+ import android.security.IKeyChainService;
+ import android.security.KeyChain;
++import android.security.KeyChainExternalSignatureRequest;
++import android.security.KeyChainExternalSignatureResult;
+ import android.security.KeyChainPrivateKeyDescriptor;
+ import android.security.KeyStore2;
+ import android.security.keystore.KeyGenParameterSpec;
+@@ -266,6 +268,18 @@ public class KeyChainService extends IntentService {
+             return KeyChainPrivateKeyDescriptor.forKeyStoreGrant(keyStoreGrant);
+         }
+ 
++        @Override
++        public KeyChainExternalSignatureResult requestExternalSignature(
++                KeyChainExternalSignatureRequest request) {
++            if (request == null) {
++                return KeyChainExternalSignatureResult.failure(
++                        KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++            }
++            request.close();
++            return KeyChainExternalSignatureResult.failure(
++                    KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++        }
++
+         @Override public byte[] getCertificate(String alias) {
+             final CallerIdentity caller = getCaller();
+             if (!hasGrant(alias, caller) && !isSystemUid(caller)) {
+diff --git a/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java b/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java
+index 148da68..4739290 100644
+--- a/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java
++++ b/tests/src/com/android/keychain/tests/BasicKeyChainServiceTest.java
+@@ -35,6 +35,8 @@ import android.security.Credentials;
+ import android.security.IKeyChainService;
+ import android.security.KeyChain;
+ import android.security.KeyChainException;
++import android.security.KeyChainExternalSignatureRequest;
++import android.security.KeyChainExternalSignatureResult;
+ import android.security.KeyChainPrivateKeyDescriptor;
+ import android.security.keystore.KeyGenParameterSpec;
+ import android.security.keystore.KeyProperties;
+@@ -50,6 +52,8 @@ import java.security.KeyStore.PrivateKeyEntry;
+ import java.security.cert.Certificate;
+ import java.security.cert.CertificateEncodingException;
+ import java.security.cert.CertificateException;
++import java.util.Arrays;
++import java.util.Objects;
+ import libcore.java.security.TestKeyStore;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -65,6 +69,10 @@ public class BasicKeyChainServiceTest {
+     private static final String ALIAS_GENERATED = "generated";
+     public static final byte[] DUMMY_CHALLENGE = {'a', 'b', 'c'};
+     private static final String ALIAS_NON_EXISTING = "nonexisting";
++    private static final String SYNTHETIC_EXTERNAL_ALIAS = "synthetic-external-alias";
++    private static final long SYNTHETIC_PROVIDER_GENERATION = 7L;
++    private static final byte SYNTHETIC_DIGEST_FILL = 'd';
++    private static final byte CLEARED_BYTE = 0;
+ 
+     private Context mContext;
+ 
+@@ -168,6 +176,42 @@ public class BasicKeyChainServiceTest {
+         assertThat(KeyChain.getPrivateKey(mContext, ALIAS_1)).isNotNull();
+     }
+ 
++    @Test
++    public void testExternalSignatureFailsClosedBeforeProviderIntegration() throws RemoteException {
++        int algorithm =
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256;
++        byte[] digest =
++                new byte[KeyChainExternalSignatureRequest.getDigestLengthBytes(algorithm)];
++        Arrays.fill(digest, SYNTHETIC_DIGEST_FILL);
++
++        try (KeyChainExternalSignatureRequest request =
++                        KeyChainExternalSignatureRequest.create(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                algorithm,
++                                digest,
++                                SYNTHETIC_PROVIDER_GENERATION);
++                KeyChainExternalSignatureResult result =
++                        Objects.requireNonNull(
++                                mKeyChainService.requestExternalSignature(request))) {
++            assertThat(result.isSuccess()).isFalse();
++            assertThat(result.getFailure())
++                    .isEqualTo(
++                            KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE);
++        } finally {
++            Arrays.fill(digest, CLEARED_BYTE);
++        }
++    }
++
++    @Test
++    public void testNullExternalSignatureRequestIsInvalid() throws RemoteException {
++        try (KeyChainExternalSignatureResult result =
++                Objects.requireNonNull(mKeyChainService.requestExternalSignature(null))) {
++            assertThat(result.isSuccess()).isFalse();
++            assertThat(result.getFailure())
++                    .isEqualTo(KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST);
++        }
++    }
++
+     @Test
+     public void testInstallAndRemoveKeyPair()
+             throws RemoteException, IOException, CertificateException {

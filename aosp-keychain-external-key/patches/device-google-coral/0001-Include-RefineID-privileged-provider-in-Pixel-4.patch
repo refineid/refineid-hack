@@ -1,0 +1,23 @@
+From da1c07451c03f1b83851dbcbe52a91783e8491ba Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 17:34:21 +0300
+Subject: [PATCH] Include RefineID privileged provider in Pixel 4
+
+---
+ aosp_flame.mk | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/aosp_flame.mk b/aosp_flame.mk
+index 573df2e..e87cc12 100644
+--- a/aosp_flame.mk
++++ b/aosp_flame.mk
+@@ -42,6 +42,7 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/handheld_vendor.mk)
+ $(call inherit-product, $(SRC_TARGET_DIR)/product/telephony_vendor.mk)
+ 
+ $(call inherit-product, device/google/coral/device-flame.mk)
++$(call inherit-product, packages/apps/RefineID/product/refineid.mk)
+ $(call inherit-product-if-exists, vendor/google_devices/coral/proprietary/device-vendor.mk)
+ $(call inherit-product-if-exists, vendor/google_devices/coral/prebuilts/device-vendor-flame.mk)
+ 
+-- 
+2.50.1 (Apple Git-155)

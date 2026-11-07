@@ -1,0 +1,568 @@
+From 8ed598172bd022d0541ad2aa6e83eab4b1de079f Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 15:14:35 +0300
+Subject: [PATCH] Add typed KeyChain private-key descriptor
+
+---
+ .../android/security/IKeyChainService.aidl    |   4 +
+ keystore/java/android/security/KeyChain.java  |  18 +-
+ .../KeyChainPrivateKeyDescriptor.aidl         |  20 ++
+ .../KeyChainPrivateKeyDescriptor.java         | 259 ++++++++++++++++++
+ .../KeyChainPrivateKeyDescriptorTest.java     | 184 +++++++++++++
+ 5 files changed, 481 insertions(+), 4 deletions(-)
+ create mode 100644 keystore/java/android/security/KeyChainPrivateKeyDescriptor.aidl
+ create mode 100644 keystore/java/android/security/KeyChainPrivateKeyDescriptor.java
+ create mode 100644 keystore/tests/src/android/security/KeyChainPrivateKeyDescriptorTest.java
+
+diff --git a/keystore/java/android/security/IKeyChainService.aidl b/keystore/java/android/security/IKeyChainService.aidl
+index 6d3d84c7..da82894c 100644
+--- a/keystore/java/android/security/IKeyChainService.aidl
++++ b/keystore/java/android/security/IKeyChainService.aidl
+@@ -19,6 +19,7 @@ import android.content.pm.StringParceledListSlice;
+ import android.security.keymaster.KeymasterCertificateChain;
+ import android.security.keystore.ParcelableKeyGenParameterSpec;
+ import android.security.AppUriAuthenticationPolicy;
++import android.security.KeyChainPrivateKeyDescriptor;
+ import android.net.Uri;
+ 
+ /**
+@@ -72,4 +73,7 @@ interface IKeyChainService {
+ 
+     // API used by Wifi
+     String getWifiKeyGrantAsUser(String alias);
++
++    // Typed replacement for requestPrivateKey. Appended to preserve existing transaction codes.
++    KeyChainPrivateKeyDescriptor requestPrivateKeyDescriptor(String alias);
+ }
+diff --git a/keystore/java/android/security/KeyChain.java b/keystore/java/android/security/KeyChain.java
+index 4b367e0e..a47f073e 100644
+--- a/keystore/java/android/security/KeyChain.java
++++ b/keystore/java/android/security/KeyChain.java
+@@ -65,6 +65,7 @@ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Objects;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+@@ -791,9 +792,10 @@ public final class KeyChain {
+             throw new NullPointerException("context == null");
+         }
+ 
+-        final String keyId;
++        final KeyChainPrivateKeyDescriptor privateKeyDescriptor;
+         try (KeyChainConnection keyChainConnection = bind(context.getApplicationContext())) {
+-            keyId = keyChainConnection.getService().requestPrivateKey(alias);
++            privateKeyDescriptor =
++                    keyChainConnection.getService().requestPrivateKeyDescriptor(alias);
+         } catch (RemoteException e) {
+             throw new KeyChainException(e);
+         } catch (RuntimeException e) {
+@@ -801,15 +803,23 @@ public final class KeyChain {
+             throw new KeyChainException(e);
+         }
+ 
+-        if (keyId == null) {
++        if (privateKeyDescriptor == null) {
+             return null;
+         }
+ 
++        if (privateKeyDescriptor.getType()
++                != KeyChainPrivateKeyDescriptor.TYPE_KEYSTORE_GRANT) {
++            throw new KeyChainException(
++                    new IllegalStateException("Unsupported KeyChain private-key descriptor"));
++        }
++
+         try {
+             return android.security.keystore2.AndroidKeyStoreProvider
+                     .loadAndroidKeyStoreKeyPairFromKeystore(
+                             KeyStore2.getInstance(),
+-                            getGrantDescriptor(keyId));
++                            getGrantDescriptor(
++                                    Objects.requireNonNull(
++                                            privateKeyDescriptor.getKeyStoreGrant())));
+         } catch (UnrecoverableKeyException | KeyPermanentlyInvalidatedException e) {
+             throw new KeyChainException(e);
+         }
+diff --git a/keystore/java/android/security/KeyChainPrivateKeyDescriptor.aidl b/keystore/java/android/security/KeyChainPrivateKeyDescriptor.aidl
+new file mode 100644
+index 00000000..f819e541
+--- /dev/null
++++ b/keystore/java/android/security/KeyChainPrivateKeyDescriptor.aidl
+@@ -0,0 +1,20 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++/** @hide */
++parcelable KeyChainPrivateKeyDescriptor;
+diff --git a/keystore/java/android/security/KeyChainPrivateKeyDescriptor.java b/keystore/java/android/security/KeyChainPrivateKeyDescriptor.java
+new file mode 100644
+index 00000000..e9832dcb
+--- /dev/null
++++ b/keystore/java/android/security/KeyChainPrivateKeyDescriptor.java
+@@ -0,0 +1,259 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++import android.annotation.IntDef;
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.os.Parcel;
++import android.os.Parcelable;
++import android.security.keystore.KeyProperties;
++
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++
++/**
++ * Describes how {@link KeyChain} can obtain a granted private key.
++ *
++ * @hide
++ */
++public final class KeyChainPrivateKeyDescriptor implements Parcelable {
++    /** The private key is an existing Keystore2 grant. */
++    public static final int TYPE_KEYSTORE_GRANT = 1;
++
++    /** The private key delegates signing to a trusted external provider. */
++    public static final int TYPE_EXTERNAL_KEY = 2;
++
++    /** @hide */
++    @IntDef(
++            prefix = {"TYPE_"},
++            value = {TYPE_KEYSTORE_GRANT, TYPE_EXTERNAL_KEY})
++    @Retention(RetentionPolicy.SOURCE)
++    public @interface Type {}
++
++    private static final int NO_SPECIAL_CONTENTS = 0;
++    private static final int NO_ENCODED_PUBLIC_KEY_LENGTH_BYTES = 0;
++    private static final int MINIMUM_ENCODED_PUBLIC_KEY_LENGTH_BYTES = 1;
++    private static final long NO_PROVIDER_GENERATION = 0L;
++    private static final long FIRST_PROVIDER_GENERATION = 1L;
++
++    private final @Type int mType;
++    private final @Nullable String mKeyStoreGrant;
++    private final @Nullable String mExternalAlias;
++    private final @Nullable String mAlgorithm;
++    private final @Nullable byte[] mEncodedPublicKey;
++    private final long mProviderGeneration;
++
++    private KeyChainPrivateKeyDescriptor(
++            @Type int type,
++            @Nullable String keyStoreGrant,
++            @Nullable String externalAlias,
++            @Nullable String algorithm,
++            @Nullable byte[] encodedPublicKey,
++            long providerGeneration) {
++        validate(
++                type,
++                keyStoreGrant,
++                externalAlias,
++                algorithm,
++                encodedPublicKey,
++                providerGeneration);
++        mType = type;
++        mKeyStoreGrant = keyStoreGrant;
++        mExternalAlias = externalAlias;
++        mAlgorithm = algorithm;
++        mEncodedPublicKey = encodedPublicKey == null ? null : encodedPublicKey.clone();
++        mProviderGeneration = providerGeneration;
++    }
++
++    private KeyChainPrivateKeyDescriptor(@NonNull Parcel source) {
++        this(
++                source.readInt(),
++                source.readString(),
++                source.readString(),
++                source.readString(),
++                source.createByteArray(),
++                source.readLong());
++    }
++
++    /** Creates a descriptor for the existing Keystore2 grant path. @hide */
++    @NonNull
++    public static KeyChainPrivateKeyDescriptor forKeyStoreGrant(@NonNull String keyStoreGrant) {
++        return new KeyChainPrivateKeyDescriptor(
++                TYPE_KEYSTORE_GRANT, keyStoreGrant, null, null, null, NO_PROVIDER_GENERATION);
++    }
++
++    /**
++     * Creates a descriptor for a trusted external signing key.
++     *
++     * <p>{@code encodedPublicKey} contains an X.509 SubjectPublicKeyInfo encoding.
++     *
++     * @hide
++     */
++    @NonNull
++    public static KeyChainPrivateKeyDescriptor forExternalKey(
++            @NonNull String externalAlias,
++            @NonNull String algorithm,
++            @NonNull byte[] encodedPublicKey,
++            long providerGeneration) {
++        return new KeyChainPrivateKeyDescriptor(
++                TYPE_EXTERNAL_KEY,
++                null,
++                externalAlias,
++                algorithm,
++                encodedPublicKey,
++                providerGeneration);
++    }
++
++    /** @hide */
++    public @Type int getType() {
++        return mType;
++    }
++
++    /** @hide */
++    @Nullable
++    public String getKeyStoreGrant() {
++        return mKeyStoreGrant;
++    }
++
++    /** @hide */
++    @Nullable
++    public String getExternalAlias() {
++        return mExternalAlias;
++    }
++
++    /** @hide */
++    @Nullable
++    public String getAlgorithm() {
++        return mAlgorithm;
++    }
++
++    /** Returns the X.509 SubjectPublicKeyInfo encoding for an external key. @hide */
++    @Nullable
++    public byte[] getEncodedPublicKey() {
++        return mEncodedPublicKey == null ? null : mEncodedPublicKey.clone();
++    }
++
++    /** @hide */
++    public long getProviderGeneration() {
++        return mProviderGeneration;
++    }
++
++    @Override
++    public int describeContents() {
++        return NO_SPECIAL_CONTENTS;
++    }
++
++    @Override
++    public void writeToParcel(@NonNull Parcel destination, int flags) {
++        destination.writeInt(mType);
++        destination.writeString(mKeyStoreGrant);
++        destination.writeString(mExternalAlias);
++        destination.writeString(mAlgorithm);
++        destination.writeByteArray(mEncodedPublicKey);
++        destination.writeLong(mProviderGeneration);
++    }
++
++    @Override
++    public String toString() {
++        return "KeyChainPrivateKeyDescriptor{"
++                + "type="
++                + typeName(mType)
++                + ", algorithm="
++                + mAlgorithm
++                + ", publicKeyLength="
++                + (mEncodedPublicKey == null
++                        ? NO_ENCODED_PUBLIC_KEY_LENGTH_BYTES
++                        : mEncodedPublicKey.length)
++                + ", providerGeneration="
++                + mProviderGeneration
++                + '}';
++    }
++
++    @NonNull
++    public static final Parcelable.Creator<KeyChainPrivateKeyDescriptor> CREATOR =
++            new Parcelable.Creator<KeyChainPrivateKeyDescriptor>() {
++                @Override
++                public KeyChainPrivateKeyDescriptor createFromParcel(Parcel source) {
++                    return new KeyChainPrivateKeyDescriptor(source);
++                }
++
++                @Override
++                public KeyChainPrivateKeyDescriptor[] newArray(int size) {
++                    return new KeyChainPrivateKeyDescriptor[size];
++                }
++            };
++
++    private static void validate(
++            @Type int type,
++            @Nullable String keyStoreGrant,
++            @Nullable String externalAlias,
++            @Nullable String algorithm,
++            @Nullable byte[] encodedPublicKey,
++            long providerGeneration) {
++        switch (type) {
++            case TYPE_KEYSTORE_GRANT:
++                requireNonEmpty(keyStoreGrant, "Keystore grant");
++                if (externalAlias != null
++                        || algorithm != null
++                        || encodedPublicKey != null
++                        || providerGeneration != NO_PROVIDER_GENERATION) {
++                    throw new IllegalArgumentException(
++                            "Keystore grant descriptor contains external-key fields");
++                }
++                return;
++            case TYPE_EXTERNAL_KEY:
++                if (keyStoreGrant != null) {
++                    throw new IllegalArgumentException(
++                            "External-key descriptor contains a Keystore grant");
++                }
++                requireNonEmpty(externalAlias, "External alias");
++                if (!KeyProperties.KEY_ALGORITHM_RSA.equals(algorithm)
++                        && !KeyProperties.KEY_ALGORITHM_EC.equals(algorithm)) {
++                    throw new IllegalArgumentException("Unsupported external-key algorithm");
++                }
++                if (encodedPublicKey == null
++                        || encodedPublicKey.length < MINIMUM_ENCODED_PUBLIC_KEY_LENGTH_BYTES) {
++                    throw new IllegalArgumentException("External public key is empty");
++                }
++                if (providerGeneration < FIRST_PROVIDER_GENERATION) {
++                    throw new IllegalArgumentException(
++                            "External provider generation must be positive");
++                }
++                return;
++            default:
++                throw new IllegalArgumentException("Unknown private-key descriptor type");
++        }
++    }
++
++    private static void requireNonEmpty(@Nullable String value, @NonNull String fieldName) {
++        if (value == null || value.isEmpty()) {
++            throw new IllegalArgumentException(fieldName + " is empty");
++        }
++    }
++
++    private static String typeName(@Type int type) {
++        switch (type) {
++            case TYPE_KEYSTORE_GRANT:
++                return "KEYSTORE_GRANT";
++            case TYPE_EXTERNAL_KEY:
++                return "EXTERNAL_KEY";
++            default:
++                return "UNKNOWN";
++        }
++    }
++}
+diff --git a/keystore/tests/src/android/security/KeyChainPrivateKeyDescriptorTest.java b/keystore/tests/src/android/security/KeyChainPrivateKeyDescriptorTest.java
+new file mode 100644
+index 00000000..323f6058
+--- /dev/null
++++ b/keystore/tests/src/android/security/KeyChainPrivateKeyDescriptorTest.java
+@@ -0,0 +1,184 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertThrows;
++
++import android.os.Parcel;
++import android.security.keystore.KeyProperties;
++
++import androidx.test.runner.AndroidJUnit4;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.nio.charset.StandardCharsets;
++import java.util.Objects;
++
++/** Unit tests for {@link KeyChainPrivateKeyDescriptor}. */
++@RunWith(AndroidJUnit4.class)
++public final class KeyChainPrivateKeyDescriptorTest {
++    private static final String SYNTHETIC_KEYSTORE_GRANT = "synthetic-keystore-grant";
++    private static final String SYNTHETIC_EXTERNAL_ALIAS = "synthetic-external-alias";
++    private static final String SYNTHETIC_PUBLIC_KEY_TEXT = "synthetic-public-key";
++    private static final String EMPTY_TEXT = "";
++    private static final byte[] SYNTHETIC_PUBLIC_KEY =
++            SYNTHETIC_PUBLIC_KEY_TEXT.getBytes(StandardCharsets.US_ASCII);
++    private static final long SYNTHETIC_PROVIDER_GENERATION = 7L;
++    private static final long NO_PROVIDER_GENERATION = 0L;
++    private static final long INVALID_PROVIDER_GENERATION = 0L;
++    private static final int UNKNOWN_DESCRIPTOR_TYPE = Integer.MAX_VALUE;
++    private static final int PARCEL_START_POSITION = 0;
++    private static final int NO_REMAINING_PARCEL_BYTES = 0;
++    private static final int EMPTY_PUBLIC_KEY_LENGTH_BYTES = 0;
++    private static final int FIRST_BYTE_INDEX = 0;
++    private static final byte MODIFIED_PUBLIC_KEY_BYTE = 'x';
++
++    @Test
++    public void keyStoreGrantRoundTripsWithoutExternalFields() {
++        KeyChainPrivateKeyDescriptor descriptor =
++                KeyChainPrivateKeyDescriptor.forKeyStoreGrant(SYNTHETIC_KEYSTORE_GRANT);
++
++        KeyChainPrivateKeyDescriptor restored = parcelRoundTrip(descriptor);
++
++        assertEquals(KeyChainPrivateKeyDescriptor.TYPE_KEYSTORE_GRANT, restored.getType());
++        assertEquals(SYNTHETIC_KEYSTORE_GRANT, restored.getKeyStoreGrant());
++        assertNull(restored.getExternalAlias());
++        assertNull(restored.getAlgorithm());
++        assertNull(restored.getEncodedPublicKey());
++        assertEquals(NO_PROVIDER_GENERATION, restored.getProviderGeneration());
++    }
++
++    @Test
++    public void externalKeyRoundTripsAndDefensivelyCopiesPublicMaterial() {
++        byte[] inputPublicKey = SYNTHETIC_PUBLIC_KEY.clone();
++        KeyChainPrivateKeyDescriptor descriptor =
++                KeyChainPrivateKeyDescriptor.forExternalKey(
++                        SYNTHETIC_EXTERNAL_ALIAS,
++                        KeyProperties.KEY_ALGORITHM_RSA,
++                        inputPublicKey,
++                        SYNTHETIC_PROVIDER_GENERATION);
++        inputPublicKey[FIRST_BYTE_INDEX] = MODIFIED_PUBLIC_KEY_BYTE;
++
++        byte[] returnedPublicKey = Objects.requireNonNull(descriptor.getEncodedPublicKey());
++        assertArrayEquals(SYNTHETIC_PUBLIC_KEY, returnedPublicKey);
++        returnedPublicKey[FIRST_BYTE_INDEX] = MODIFIED_PUBLIC_KEY_BYTE;
++
++        KeyChainPrivateKeyDescriptor restored = parcelRoundTrip(descriptor);
++
++        assertEquals(KeyChainPrivateKeyDescriptor.TYPE_EXTERNAL_KEY, restored.getType());
++        assertNull(restored.getKeyStoreGrant());
++        assertEquals(SYNTHETIC_EXTERNAL_ALIAS, restored.getExternalAlias());
++        assertEquals(KeyProperties.KEY_ALGORITHM_RSA, restored.getAlgorithm());
++        assertArrayEquals(SYNTHETIC_PUBLIC_KEY, restored.getEncodedPublicKey());
++        assertEquals(SYNTHETIC_PROVIDER_GENERATION, restored.getProviderGeneration());
++    }
++
++    @Test
++    public void factoriesRejectMalformedDescriptors() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> KeyChainPrivateKeyDescriptor.forKeyStoreGrant(EMPTY_TEXT));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainPrivateKeyDescriptor.forExternalKey(
++                                EMPTY_TEXT,
++                                KeyProperties.KEY_ALGORITHM_RSA,
++                                SYNTHETIC_PUBLIC_KEY,
++                                SYNTHETIC_PROVIDER_GENERATION));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainPrivateKeyDescriptor.forExternalKey(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                KeyProperties.KEY_ALGORITHM_AES,
++                                SYNTHETIC_PUBLIC_KEY,
++                                SYNTHETIC_PROVIDER_GENERATION));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainPrivateKeyDescriptor.forExternalKey(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                KeyProperties.KEY_ALGORITHM_RSA,
++                                new byte[EMPTY_PUBLIC_KEY_LENGTH_BYTES],
++                                SYNTHETIC_PROVIDER_GENERATION));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainPrivateKeyDescriptor.forExternalKey(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                KeyProperties.KEY_ALGORITHM_RSA,
++                                SYNTHETIC_PUBLIC_KEY,
++                                INVALID_PROVIDER_GENERATION));
++    }
++
++    @Test
++    public void parcelRejectsUnknownDescriptorType() {
++        Parcel parcel = Parcel.obtain();
++        try {
++            parcel.writeInt(UNKNOWN_DESCRIPTOR_TYPE);
++            parcel.writeString(null);
++            parcel.writeString(null);
++            parcel.writeString(null);
++            parcel.writeByteArray(null);
++            parcel.writeLong(INVALID_PROVIDER_GENERATION);
++            parcel.setDataPosition(PARCEL_START_POSITION);
++
++            assertThrows(
++                    IllegalArgumentException.class,
++                    () -> KeyChainPrivateKeyDescriptor.CREATOR.createFromParcel(parcel));
++        } finally {
++            parcel.recycle();
++        }
++    }
++
++    @Test
++    public void stringFormOmitsCapabilityAliasAndPublicKey() {
++        KeyChainPrivateKeyDescriptor keyStoreDescriptor =
++                KeyChainPrivateKeyDescriptor.forKeyStoreGrant(SYNTHETIC_KEYSTORE_GRANT);
++        KeyChainPrivateKeyDescriptor externalDescriptor =
++                KeyChainPrivateKeyDescriptor.forExternalKey(
++                        SYNTHETIC_EXTERNAL_ALIAS,
++                        KeyProperties.KEY_ALGORITHM_RSA,
++                        SYNTHETIC_PUBLIC_KEY,
++                        SYNTHETIC_PROVIDER_GENERATION);
++
++        assertFalse(keyStoreDescriptor.toString().contains(SYNTHETIC_KEYSTORE_GRANT));
++        assertFalse(externalDescriptor.toString().contains(SYNTHETIC_EXTERNAL_ALIAS));
++        assertFalse(externalDescriptor.toString().contains(SYNTHETIC_PUBLIC_KEY_TEXT));
++    }
++
++    private static KeyChainPrivateKeyDescriptor parcelRoundTrip(
++            KeyChainPrivateKeyDescriptor descriptor) {
++        Parcel parcel = Parcel.obtain();
++        try {
++            descriptor.writeToParcel(parcel, descriptor.describeContents());
++            parcel.setDataPosition(PARCEL_START_POSITION);
++            KeyChainPrivateKeyDescriptor restored =
++                    KeyChainPrivateKeyDescriptor.CREATOR.createFromParcel(parcel);
++            assertEquals(NO_REMAINING_PARCEL_BYTES, parcel.dataAvail());
++            return restored;
++        } finally {
++            parcel.recycle();
++        }
++    }
++}

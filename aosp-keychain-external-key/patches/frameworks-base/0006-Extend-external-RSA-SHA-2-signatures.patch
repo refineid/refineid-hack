@@ -1,0 +1,770 @@
+From 9afc75f55ac337e813ab9e43dd9e44011ee06441 Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 23:30:02 +0300
+Subject: [PATCH] Extend external RSA SHA-2 signatures
+
+---
+ .../security/KeyChainExternalKeyProvider.java |  14 ++
+ .../KeyChainExternalSignatureRequest.java     |  44 +++-
+ .../KeyChainExternalSignatureSpi.java         | 211 +++++++++++++---
+ .../KeyChainExternalKeyProviderTest.java      | 234 ++++++++++++++----
+ .../KeyChainExternalSignatureParcelTest.java  |  28 ++-
+ 5 files changed, 429 insertions(+), 102 deletions(-)
+
+diff --git a/keystore/java/android/security/KeyChainExternalKeyProvider.java b/keystore/java/android/security/KeyChainExternalKeyProvider.java
+index 8e8fd685..aecc1c21 100644
+--- a/keystore/java/android/security/KeyChainExternalKeyProvider.java
++++ b/keystore/java/android/security/KeyChainExternalKeyProvider.java
+@@ -24,6 +24,10 @@ public final class KeyChainExternalKeyProvider extends Provider {
+ 
+     static final String JCA_SHA256_WITH_RSA = "SHA256withRSA";
+     static final String JCA_SHA256_WITH_RSA_PSS = "SHA256withRSA/PSS";
++    static final String JCA_SHA384_WITH_RSA = "SHA384withRSA";
++    static final String JCA_SHA384_WITH_RSA_PSS = "SHA384withRSA/PSS";
++    static final String JCA_SHA512_WITH_RSA = "SHA512withRSA";
++    static final String JCA_SHA512_WITH_RSA_PSS = "SHA512withRSA/PSS";
+     static final String JCA_SHA256_WITH_ECDSA = "SHA256withECDSA";
+     static final String JCA_SHA384_WITH_ECDSA = "SHA384withECDSA";
+     static final String JCA_NONE_WITH_RSA = "NONEwithRSA";
+@@ -45,6 +49,16 @@ public final class KeyChainExternalKeyProvider extends Provider {
+         putSignature(
+                 JCA_SHA256_WITH_RSA_PSS,
+                 PACKAGE_NAME + ".KeyChainExternalSignatureSpi$Sha256WithRsaPss");
++        putSignature(
++                JCA_SHA384_WITH_RSA, PACKAGE_NAME + ".KeyChainExternalSignatureSpi$Sha384WithRsa");
++        putSignature(
++                JCA_SHA384_WITH_RSA_PSS,
++                PACKAGE_NAME + ".KeyChainExternalSignatureSpi$Sha384WithRsaPss");
++        putSignature(
++                JCA_SHA512_WITH_RSA, PACKAGE_NAME + ".KeyChainExternalSignatureSpi$Sha512WithRsa");
++        putSignature(
++                JCA_SHA512_WITH_RSA_PSS,
++                PACKAGE_NAME + ".KeyChainExternalSignatureSpi$Sha512WithRsaPss");
+         putSignature(
+                 JCA_SHA256_WITH_ECDSA,
+                 PACKAGE_NAME + ".KeyChainExternalSignatureSpi$Sha256WithEcdsa");
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureRequest.java b/keystore/java/android/security/KeyChainExternalSignatureRequest.java
+index a8fe4bdb..37f8d907 100644
+--- a/keystore/java/android/security/KeyChainExternalSignatureRequest.java
++++ b/keystore/java/android/security/KeyChainExternalSignatureRequest.java
+@@ -48,6 +48,18 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+     /** ECDSA with a P-384 key and a SHA-384 digest. */
+     public static final int SIGNATURE_ALGORITHM_ECDSA_P384_SHA384 = 4;
+ 
++    /** RSASSA-PKCS1-v1_5 with SHA-384 and an RSA key. */
++    public static final int SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384 = 5;
++
++    /** RSASSA-PSS with SHA-384, MGF1-SHA-384, and a digest-length salt. */
++    public static final int SIGNATURE_ALGORITHM_RSA_PSS_SHA384 = 6;
++
++    /** RSASSA-PKCS1-v1_5 with SHA-512 and an RSA key. */
++    public static final int SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512 = 7;
++
++    /** RSASSA-PSS with SHA-512, MGF1-SHA-512, and a digest-length salt. */
++    public static final int SIGNATURE_ALGORITHM_RSA_PSS_SHA512 = 8;
++
+     /** @hide */
+     @IntDef(
+             prefix = {"SIGNATURE_ALGORITHM_"},
+@@ -55,7 +67,11 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+                 SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256,
+                 SIGNATURE_ALGORITHM_RSA_PSS_SHA256,
+                 SIGNATURE_ALGORITHM_ECDSA_P384_SHA256,
+-                SIGNATURE_ALGORITHM_ECDSA_P384_SHA384
++                SIGNATURE_ALGORITHM_ECDSA_P384_SHA384,
++                SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384,
++                SIGNATURE_ALGORITHM_RSA_PSS_SHA384,
++                SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512,
++                SIGNATURE_ALGORITHM_RSA_PSS_SHA512
+             })
+     @Retention(RetentionPolicy.SOURCE)
+     public @interface SignatureAlgorithm {}
+@@ -63,8 +79,10 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+     private static final int NO_SPECIAL_CONTENTS = 0;
+     private static final int SHA256_DIGEST_LENGTH_BITS = 256;
+     private static final int SHA384_DIGEST_LENGTH_BITS = 384;
++    private static final int SHA512_DIGEST_LENGTH_BITS = 512;
+     private static final int SHA256_DIGEST_LENGTH_BYTES = SHA256_DIGEST_LENGTH_BITS / Byte.SIZE;
+     private static final int SHA384_DIGEST_LENGTH_BYTES = SHA384_DIGEST_LENGTH_BITS / Byte.SIZE;
++    private static final int SHA512_DIGEST_LENGTH_BYTES = SHA512_DIGEST_LENGTH_BITS / Byte.SIZE;
+     private static final long FIRST_PROVIDER_GENERATION = 1L;
+     private static final byte CLEARED_BYTE = 0;
+ 
+@@ -83,12 +101,7 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         Objects.requireNonNull(ownedDigest);
+         try {
+             Objects.requireNonNull(externalAlias);
+-            validate(
+-                    externalAlias,
+-                    algorithm,
+-                    ownedDigest,
+-                    providerGeneration,
+-                    operationToken);
++            validate(externalAlias, algorithm, ownedDigest, providerGeneration, operationToken);
+         } catch (RuntimeException exception) {
+             Arrays.fill(ownedDigest, CLEARED_BYTE);
+             throw exception;
+@@ -164,7 +177,12 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+             case SIGNATURE_ALGORITHM_ECDSA_P384_SHA256:
+                 return SHA256_DIGEST_LENGTH_BYTES;
+             case SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384:
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA384:
+                 return SHA384_DIGEST_LENGTH_BYTES;
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512:
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA512:
++                return SHA512_DIGEST_LENGTH_BYTES;
+             default:
+                 throw new IllegalArgumentException("Unknown external signature algorithm");
+         }
+@@ -176,6 +194,10 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         switch (algorithm) {
+             case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256:
+             case SIGNATURE_ALGORITHM_RSA_PSS_SHA256:
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384:
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA384:
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512:
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA512:
+                 return KeyProperties.KEY_ALGORITHM_RSA;
+             case SIGNATURE_ALGORITHM_ECDSA_P384_SHA256:
+             case SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
+@@ -326,6 +348,14 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+                 return "ECDSA_P384_SHA256";
+             case SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
+                 return "ECDSA_P384_SHA384";
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384:
++                return "RSA_PKCS1_SHA384";
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA384:
++                return "RSA_PSS_SHA384";
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512:
++                return "RSA_PKCS1_SHA512";
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA512:
++                return "RSA_PSS_SHA512";
+             default:
+                 return "UNKNOWN";
+         }
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureSpi.java b/keystore/java/android/security/KeyChainExternalSignatureSpi.java
+index 26cdedc0..0a565aa8 100644
+--- a/keystore/java/android/security/KeyChainExternalSignatureSpi.java
++++ b/keystore/java/android/security/KeyChainExternalSignatureSpi.java
+@@ -44,6 +44,7 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+             "External KeyChain signature was already consumed";
+     private static final String SIGNATURE_PARAMETERS_FIXED_MESSAGE =
+             "External KeyChain signature parameters are fixed";
++    private static final String JCA_MGF1 = "MGF1";
+ 
+     private final @NonNull String mRequiredKeyAlgorithm;
+     private final @NonNull SignatureInput mInput;
+@@ -174,8 +175,6 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+ 
+     /** SHA-256 with RSASSA-PSS. @hide */
+     public static final class Sha256WithRsaPss extends KeyChainExternalSignatureSpi {
+-        private static final String JCA_MGF1 = "MGF1";
+-
+         public Sha256WithRsaPss() {
+             super(
+                     KeyProperties.KEY_ALGORITHM_RSA,
+@@ -187,21 +186,63 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+         @Override
+         void validateParameters(AlgorithmParameterSpec parameters)
+                 throws InvalidAlgorithmParameterException {
+-            if (!(parameters instanceof PSSParameterSpec)) {
+-                throw new InvalidAlgorithmParameterException(SIGNATURE_PARAMETERS_FIXED_MESSAGE);
+-            }
+-            PSSParameterSpec pssParameters = (PSSParameterSpec) parameters;
+-            AlgorithmParameterSpec maskGenerationParameters = pssParameters.getMGFParameters();
+-            if (!Hash.SHA256.jcaName.equalsIgnoreCase(pssParameters.getDigestAlgorithm())
+-                    || !JCA_MGF1.equalsIgnoreCase(pssParameters.getMGFAlgorithm())
+-                    || !(maskGenerationParameters instanceof MGF1ParameterSpec)
+-                    || !Hash.SHA256.jcaName.equalsIgnoreCase(
+-                            ((MGF1ParameterSpec) maskGenerationParameters).getDigestAlgorithm())
+-                    || pssParameters.getSaltLength() != Hash.SHA256.digestLengthBytes
+-                    || pssParameters.getTrailerField()
+-                            != PSSParameterSpec.DEFAULT.getTrailerField()) {
+-                throw new InvalidAlgorithmParameterException(SIGNATURE_PARAMETERS_FIXED_MESSAGE);
+-            }
++            validateRsaPssParameters(parameters, Hash.SHA256);
++        }
++    }
++
++    /** SHA-384 with RSASSA-PKCS1-v1_5. @hide */
++    public static final class Sha384WithRsa extends KeyChainExternalSignatureSpi {
++        public Sha384WithRsa() {
++            super(
++                    KeyProperties.KEY_ALGORITHM_RSA,
++                    new HashedInput(
++                            Hash.SHA384,
++                            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384));
++        }
++    }
++
++    /** SHA-384 with RSASSA-PSS. @hide */
++    public static final class Sha384WithRsaPss extends KeyChainExternalSignatureSpi {
++        public Sha384WithRsaPss() {
++            super(
++                    KeyProperties.KEY_ALGORITHM_RSA,
++                    new HashedInput(
++                            Hash.SHA384,
++                            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384));
++        }
++
++        @Override
++        void validateParameters(AlgorithmParameterSpec parameters)
++                throws InvalidAlgorithmParameterException {
++            validateRsaPssParameters(parameters, Hash.SHA384);
++        }
++    }
++
++    /** SHA-512 with RSASSA-PKCS1-v1_5. @hide */
++    public static final class Sha512WithRsa extends KeyChainExternalSignatureSpi {
++        public Sha512WithRsa() {
++            super(
++                    KeyProperties.KEY_ALGORITHM_RSA,
++                    new HashedInput(
++                            Hash.SHA512,
++                            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512));
++        }
++    }
++
++    /** SHA-512 with RSASSA-PSS. @hide */
++    public static final class Sha512WithRsaPss extends KeyChainExternalSignatureSpi {
++        public Sha512WithRsaPss() {
++            super(
++                    KeyProperties.KEY_ALGORITHM_RSA,
++                    new HashedInput(
++                            Hash.SHA512,
++                            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512));
++        }
++
++        @Override
++        void validateParameters(AlgorithmParameterSpec parameters)
++                throws InvalidAlgorithmParameterException {
++            validateRsaPssParameters(parameters, Hash.SHA512);
+         }
+     }
+ 
+@@ -229,7 +270,7 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+         }
+     }
+ 
+-    /** Strict SHA-256 DigestInfo input with RSASSA-PKCS1-v1_5. @hide */
++    /** Strict SHA-2 DigestInfo input with RSASSA-PKCS1-v1_5. @hide */
+     public static final class NoneWithRsa extends KeyChainExternalSignatureSpi {
+         public NoneWithRsa() {
+             super(KeyProperties.KEY_ALGORITHM_RSA, new RsaDigestInfoInput());
+@@ -251,7 +292,11 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+         SHA384(
+                 "SHA-384",
+                 KeyChainExternalSignatureRequest.getDigestLengthBytes(
+-                        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384));
++                        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384)),
++        SHA512(
++                "SHA-512",
++                KeyChainExternalSignatureRequest.getDigestLengthBytes(
++                        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512));
+ 
+         final @NonNull String jcaName;
+         final int digestLengthBytes;
+@@ -262,6 +307,25 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+         }
+     }
+ 
++    private static void validateRsaPssParameters(
++            AlgorithmParameterSpec parameters, @NonNull Hash requiredHash)
++            throws InvalidAlgorithmParameterException {
++        if (!(parameters instanceof PSSParameterSpec)) {
++            throw new InvalidAlgorithmParameterException(SIGNATURE_PARAMETERS_FIXED_MESSAGE);
++        }
++        PSSParameterSpec pssParameters = (PSSParameterSpec) parameters;
++        AlgorithmParameterSpec maskGenerationParameters = pssParameters.getMGFParameters();
++        if (!requiredHash.jcaName.equalsIgnoreCase(pssParameters.getDigestAlgorithm())
++                || !JCA_MGF1.equalsIgnoreCase(pssParameters.getMGFAlgorithm())
++                || !(maskGenerationParameters instanceof MGF1ParameterSpec)
++                || !requiredHash.jcaName.equalsIgnoreCase(
++                        ((MGF1ParameterSpec) maskGenerationParameters).getDigestAlgorithm())
++                || pssParameters.getSaltLength() != requiredHash.digestLengthBytes
++                || pssParameters.getTrailerField() != PSSParameterSpec.DEFAULT.getTrailerField()) {
++            throw new InvalidAlgorithmParameterException(SIGNATURE_PARAMETERS_FIXED_MESSAGE);
++        }
++    }
++
+     private interface SignatureInput {
+         void update(byte input) throws SignatureException;
+ 
+@@ -370,7 +434,7 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+     }
+ 
+     private static final class RsaDigestInfoInput extends BoundedInput {
+-        // RFC 8017 section 9.2, note 1: DER prefix for id-sha256 DigestInfo.
++        // RFC 8017 section 9.2, note 1: DER prefixes for SHA-2 DigestInfo values.
+         private static final byte[] SHA256_DIGEST_INFO_PREFIX = {
+             0x30,
+             0x31,
+@@ -392,33 +456,108 @@ public abstract class KeyChainExternalSignatureSpi extends SignatureSpi {
+             0x04,
+             0x20
+         };
+-        private static final int INPUT_LENGTH_BYTES =
+-                SHA256_DIGEST_INFO_PREFIX.length + Hash.SHA256.digestLengthBytes;
++        private static final byte[] SHA384_DIGEST_INFO_PREFIX = {
++            0x30,
++            0x41,
++            0x30,
++            0x0d,
++            0x06,
++            0x09,
++            0x60,
++            (byte) 0x86,
++            0x48,
++            0x01,
++            0x65,
++            0x03,
++            0x04,
++            0x02,
++            0x02,
++            0x05,
++            0x00,
++            0x04,
++            0x30
++        };
++        private static final byte[] SHA512_DIGEST_INFO_PREFIX = {
++            0x30,
++            0x51,
++            0x30,
++            0x0d,
++            0x06,
++            0x09,
++            0x60,
++            (byte) 0x86,
++            0x48,
++            0x01,
++            0x65,
++            0x03,
++            0x04,
++            0x02,
++            0x03,
++            0x05,
++            0x00,
++            0x04,
++            0x40
++        };
++        private static final int MAXIMUM_INPUT_LENGTH_BYTES =
++                SHA512_DIGEST_INFO_PREFIX.length + Hash.SHA512.digestLengthBytes;
+ 
+         RsaDigestInfoInput() {
+-            super(INPUT_LENGTH_BYTES);
++            super(MAXIMUM_INPUT_LENGTH_BYTES);
+         }
+ 
+         @Override
+         PreparedInput prepare(byte[] input, int length) throws SignatureException {
+-            if (length != INPUT_LENGTH_BYTES || !hasSha256Prefix(input)) {
+-                throw new SignatureException("External RSA input is not SHA-256 DigestInfo");
++            for (RsaDigestInfo digestInfo : RsaDigestInfo.values()) {
++                if (digestInfo.matches(input, length)) {
++                    return new PreparedInput(
++                            digestInfo.algorithm, digestInfo.extractDigest(input, length));
++                }
++            }
++            throw new SignatureException("External RSA input is not a supported DigestInfo");
++        }
++
++        private enum RsaDigestInfo {
++            SHA256(
++                    Hash.SHA256,
++                    KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256,
++                    SHA256_DIGEST_INFO_PREFIX),
++            SHA384(
++                    Hash.SHA384,
++                    KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384,
++                    SHA384_DIGEST_INFO_PREFIX),
++            SHA512(
++                    Hash.SHA512,
++                    KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512,
++                    SHA512_DIGEST_INFO_PREFIX);
++
++            private final @NonNull Hash hash;
++            private final @KeyChainExternalSignatureRequest.SignatureAlgorithm int algorithm;
++            private final byte[] prefix;
++
++            RsaDigestInfo(
++                    @NonNull Hash hash,
++                    @KeyChainExternalSignatureRequest.SignatureAlgorithm int algorithm,
++                    byte[] prefix) {
++                this.hash = hash;
++                this.algorithm = algorithm;
++                this.prefix = prefix;
+             }
+-            byte[] digest =
+-                    Arrays.copyOfRange(input, SHA256_DIGEST_INFO_PREFIX.length, INPUT_LENGTH_BYTES);
+-            return new PreparedInput(
+-                    KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256, digest);
+-        }
+ 
+-        private static boolean hasSha256Prefix(byte[] input) {
+-            for (int index = BoundedInput.FIRST_ARRAY_INDEX;
+-                    index < SHA256_DIGEST_INFO_PREFIX.length;
+-                    index++) {
+-                if (input[index] != SHA256_DIGEST_INFO_PREFIX[index]) {
++            boolean matches(byte[] input, int length) {
++                if (length != prefix.length + hash.digestLengthBytes) {
+                     return false;
+                 }
++                for (int index = BoundedInput.FIRST_ARRAY_INDEX; index < prefix.length; index++) {
++                    if (input[index] != prefix[index]) {
++                        return false;
++                    }
++                }
++                return true;
++            }
++
++            byte[] extractDigest(byte[] input, int length) {
++                return Arrays.copyOfRange(input, prefix.length, length);
+             }
+-            return true;
+         }
+     }
+ 
+diff --git a/keystore/tests/src/android/security/KeyChainExternalKeyProviderTest.java b/keystore/tests/src/android/security/KeyChainExternalKeyProviderTest.java
+index 82d7e5ff..4682c41a 100644
+--- a/keystore/tests/src/android/security/KeyChainExternalKeyProviderTest.java
++++ b/keystore/tests/src/android/security/KeyChainExternalKeyProviderTest.java
+@@ -64,6 +64,7 @@ public final class KeyChainExternalKeyProviderTest {
+     private static final String EMPTY_TEXT = "";
+     private static final String JCA_SHA256 = "SHA-256";
+     private static final String JCA_SHA384 = "SHA-384";
++    private static final String JCA_SHA512 = "SHA-512";
+     private static final String JCA_MGF1 = "MGF1";
+     private static final String FIREFOX_NONE_WITH_RSA = "NoneWithRSA";
+     private static final String FIREFOX_NONE_WITH_ECDSA = "NoneWithECDSA";
+@@ -114,6 +115,52 @@ public final class KeyChainExternalKeyProviderTest {
+         0x20
+     };
+ 
++    // RFC 8017 section 9.2, note 1: DER prefix for id-sha384 DigestInfo.
++    private static final byte[] SHA384_DIGEST_INFO_PREFIX = {
++        0x30,
++        0x41,
++        0x30,
++        0x0d,
++        0x06,
++        0x09,
++        0x60,
++        (byte) 0x86,
++        0x48,
++        0x01,
++        0x65,
++        0x03,
++        0x04,
++        0x02,
++        0x02,
++        0x05,
++        0x00,
++        0x04,
++        0x30
++    };
++
++    // RFC 8017 section 9.2, note 1: DER prefix for id-sha512 DigestInfo.
++    private static final byte[] SHA512_DIGEST_INFO_PREFIX = {
++        0x30,
++        0x51,
++        0x30,
++        0x0d,
++        0x06,
++        0x09,
++        0x60,
++        (byte) 0x86,
++        0x48,
++        0x01,
++        0x65,
++        0x03,
++        0x04,
++        0x02,
++        0x03,
++        0x05,
++        0x00,
++        0x04,
++        0x40
++    };
++
+     private static final SignatureCase[] HASHED_SIGNATURE_CASES = {
+         new SignatureCase(
+                 KeyChainExternalKeyProvider.JCA_SHA256_WITH_RSA,
+@@ -125,6 +172,26 @@ public final class KeyChainExternalKeyProviderTest {
+                 JCA_SHA256,
+                 KeyProperties.KEY_ALGORITHM_RSA,
+                 KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA256),
++        new SignatureCase(
++                KeyChainExternalKeyProvider.JCA_SHA384_WITH_RSA,
++                JCA_SHA384,
++                KeyProperties.KEY_ALGORITHM_RSA,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384),
++        new SignatureCase(
++                KeyChainExternalKeyProvider.JCA_SHA384_WITH_RSA_PSS,
++                JCA_SHA384,
++                KeyProperties.KEY_ALGORITHM_RSA,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384),
++        new SignatureCase(
++                KeyChainExternalKeyProvider.JCA_SHA512_WITH_RSA,
++                JCA_SHA512,
++                KeyProperties.KEY_ALGORITHM_RSA,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512),
++        new SignatureCase(
++                KeyChainExternalKeyProvider.JCA_SHA512_WITH_RSA_PSS,
++                JCA_SHA512,
++                KeyProperties.KEY_ALGORITHM_RSA,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512),
+         new SignatureCase(
+                 KeyChainExternalKeyProvider.JCA_SHA256_WITH_ECDSA,
+                 JCA_SHA256,
+@@ -137,6 +204,36 @@ public final class KeyChainExternalKeyProviderTest {
+                 KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384)
+     };
+ 
++    private static final RsaDigestInfoCase[] RSA_DIGEST_INFO_CASES = {
++        new RsaDigestInfoCase(
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256,
++                SHA256_DIGEST_INFO_PREFIX),
++        new RsaDigestInfoCase(
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384,
++                SHA384_DIGEST_INFO_PREFIX),
++        new RsaDigestInfoCase(
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512,
++                SHA512_DIGEST_INFO_PREFIX)
++    };
++
++    private static final RsaPssCase[] RSA_PSS_CASES = {
++        new RsaPssCase(
++                KeyChainExternalKeyProvider.JCA_SHA256_WITH_RSA_PSS,
++                JCA_SHA256,
++                MGF1ParameterSpec.SHA256,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA256),
++        new RsaPssCase(
++                KeyChainExternalKeyProvider.JCA_SHA384_WITH_RSA_PSS,
++                JCA_SHA384,
++                MGF1ParameterSpec.SHA384,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384),
++        new RsaPssCase(
++                KeyChainExternalKeyProvider.JCA_SHA512_WITH_RSA_PSS,
++                JCA_SHA512,
++                MGF1ParameterSpec.SHA512,
++                KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512)
++    };
++
+     private Provider mPreviousProvider;
+     private int mProviderPosition;
+     private final List<RecordingSigningOperation> mOperations = new ArrayList<>();
+@@ -274,67 +371,68 @@ public final class KeyChainExternalKeyProviderTest {
+     }
+ 
+     @Test
+-    public void noneWithRsaStrictlyExtractsSha256DigestInfo() throws Exception {
+-        int algorithm = KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256;
+-        byte[] digest = syntheticDigest(algorithm);
+-        byte[] digestInfo = concatenate(SHA256_DIGEST_INFO_PREFIX, digest);
+-        RecordingSigningOperation operation = newOperation();
+-        Signature signer = Signature.getInstance(FIREFOX_NONE_WITH_RSA);
++    public void noneWithRsaStrictlyExtractsEverySupportedDigestInfo() throws Exception {
++        for (RsaDigestInfoCase digestInfoCase : RSA_DIGEST_INFO_CASES) {
++            byte[] digest = syntheticDigest(digestInfoCase.algorithm);
++            byte[] digestInfo = concatenate(digestInfoCase.prefix, digest);
++            RecordingSigningOperation operation = newOperation();
++            Signature signer = Signature.getInstance(FIREFOX_NONE_WITH_RSA);
+ 
+-        signer.initSign(externalKey(KeyProperties.KEY_ALGORITHM_RSA, operation));
+-        signer.update(digestInfo);
+-        byte[] signature = signer.sign();
++            signer.initSign(externalKey(KeyProperties.KEY_ALGORITHM_RSA, operation));
++            signer.update(digestInfo);
++            byte[] signature = signer.sign();
+ 
+-        assertEquals(algorithm, operation.observedAlgorithm);
+-        assertArrayEquals(digest, operation.observedDigest);
++            assertEquals(digestInfoCase.algorithm, operation.observedAlgorithm);
++            assertArrayEquals(digest, operation.observedDigest);
+ 
+-        byte[] malformedDigestInfo = digestInfo.clone();
+-        malformedDigestInfo[FIRST_BYTE_INDEX] = MODIFIED_BYTE;
+-        RecordingSigningOperation rejectedOperation = newOperation();
+-        Signature rejectedSigner = Signature.getInstance(FIREFOX_NONE_WITH_RSA);
+-        rejectedSigner.initSign(externalKey(KeyProperties.KEY_ALGORITHM_RSA, rejectedOperation));
+-        rejectedSigner.update(malformedDigestInfo);
++            byte[] malformedDigestInfo = digestInfo.clone();
++            malformedDigestInfo[FIRST_BYTE_INDEX] = MODIFIED_BYTE;
++            RecordingSigningOperation rejectedOperation = newOperation();
++            Signature rejectedSigner = Signature.getInstance(FIREFOX_NONE_WITH_RSA);
++            rejectedSigner.initSign(
++                    externalKey(KeyProperties.KEY_ALGORITHM_RSA, rejectedOperation));
++            rejectedSigner.update(malformedDigestInfo);
+ 
+-        assertThrows(SignatureException.class, rejectedSigner::sign);
+-        assertEquals(RecordingSigningOperation.NO_CALLS, rejectedOperation.callCount);
+-        Arrays.fill(digest, CLEARED_BYTE);
+-        Arrays.fill(digestInfo, CLEARED_BYTE);
+-        Arrays.fill(malformedDigestInfo, CLEARED_BYTE);
+-        Arrays.fill(signature, CLEARED_BYTE);
++            assertThrows(SignatureException.class, rejectedSigner::sign);
++            assertEquals(RecordingSigningOperation.NO_CALLS, rejectedOperation.callCount);
++            Arrays.fill(digest, CLEARED_BYTE);
++            Arrays.fill(digestInfo, CLEARED_BYTE);
++            Arrays.fill(malformedDigestInfo, CLEARED_BYTE);
++            Arrays.fill(signature, CLEARED_BYTE);
++        }
+     }
+ 
+     @Test
+-    public void rsaPssAcceptsOnlyItsFixedParameters() throws Exception {
+-        int digestLength =
+-                KeyChainExternalSignatureRequest.getDigestLengthBytes(
+-                        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA256);
+-        PSSParameterSpec expectedParameters =
+-                new PSSParameterSpec(
+-                        JCA_SHA256,
+-                        JCA_MGF1,
+-                        MGF1ParameterSpec.SHA256,
+-                        digestLength,
+-                        PSSParameterSpec.DEFAULT.getTrailerField());
+-        PSSParameterSpec wrongSaltLength =
+-                new PSSParameterSpec(
+-                        JCA_SHA256,
+-                        JCA_MGF1,
+-                        MGF1ParameterSpec.SHA256,
+-                        digestLength + SINGLE_EXCESS_BYTE_COUNT,
+-                        PSSParameterSpec.DEFAULT.getTrailerField());
+-        Signature accepted =
+-                Signature.getInstance(
+-                        KeyChainExternalKeyProvider.JCA_SHA256_WITH_RSA_PSS,
+-                        KeyChainExternalKeyProvider.PROVIDER_NAME);
+-        Signature rejected =
+-                Signature.getInstance(
+-                        KeyChainExternalKeyProvider.JCA_SHA256_WITH_RSA_PSS,
+-                        KeyChainExternalKeyProvider.PROVIDER_NAME);
+-
+-        accepted.setParameter(expectedParameters);
+-        assertThrows(
+-                java.security.InvalidAlgorithmParameterException.class,
+-                () -> rejected.setParameter(wrongSaltLength));
++    public void rsaPssAcceptsOnlyEachHashsFixedParameters() throws Exception {
++        for (RsaPssCase pssCase : RSA_PSS_CASES) {
++            int digestLength =
++                    KeyChainExternalSignatureRequest.getDigestLengthBytes(pssCase.algorithm);
++            PSSParameterSpec expectedParameters =
++                    new PSSParameterSpec(
++                            pssCase.digestJcaName,
++                            JCA_MGF1,
++                            pssCase.mgfSpecification,
++                            digestLength,
++                            PSSParameterSpec.DEFAULT.getTrailerField());
++            PSSParameterSpec wrongSaltLength =
++                    new PSSParameterSpec(
++                            pssCase.digestJcaName,
++                            JCA_MGF1,
++                            pssCase.mgfSpecification,
++                            digestLength + SINGLE_EXCESS_BYTE_COUNT,
++                            PSSParameterSpec.DEFAULT.getTrailerField());
++            Signature accepted =
++                    Signature.getInstance(
++                            pssCase.jcaName, KeyChainExternalKeyProvider.PROVIDER_NAME);
++            Signature rejected =
++                    Signature.getInstance(
++                            pssCase.jcaName, KeyChainExternalKeyProvider.PROVIDER_NAME);
++
++            accepted.setParameter(expectedParameters);
++            assertThrows(
++                    java.security.InvalidAlgorithmParameterException.class,
++                    () -> rejected.setParameter(wrongSaltLength));
++        }
+         assertNull(
+                 Security.getProvider(KeyChainExternalKeyProvider.PROVIDER_NAME)
+                         .getService(JCA_SIGNATURE_SERVICE, UNSUPPORTED_RAW_RSA));
+@@ -563,6 +661,34 @@ public final class KeyChainExternalKeyProviderTest {
+         }
+     }
+ 
++    private static final class RsaDigestInfoCase {
++        final int algorithm;
++        final byte[] prefix;
++
++        RsaDigestInfoCase(int algorithm, byte[] prefix) {
++            this.algorithm = algorithm;
++            this.prefix = prefix;
++        }
++    }
++
++    private static final class RsaPssCase {
++        final String jcaName;
++        final String digestJcaName;
++        final MGF1ParameterSpec mgfSpecification;
++        final int algorithm;
++
++        RsaPssCase(
++                String jcaName,
++                String digestJcaName,
++                MGF1ParameterSpec mgfSpecification,
++                int algorithm) {
++            this.jcaName = jcaName;
++            this.digestJcaName = digestJcaName;
++            this.mgfSpecification = mgfSpecification;
++            this.algorithm = algorithm;
++        }
++    }
++
+     private static final class RecordingSigningOperation
+             implements KeyChainExternalPrivateKey.SigningOperation, AutoCloseable {
+         static final int NO_CALLS = 0;
+diff --git a/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java b/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+index 31ddd70c..8b1a3080 100644
+--- a/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
++++ b/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+@@ -60,7 +60,11 @@ public final class KeyChainExternalSignatureParcelTest {
+         KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256,
+         KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA256,
+         KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA256,
+-        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512
+     };
+ 
+     private static final int[] COARSE_FAILURES = {
+@@ -81,10 +85,7 @@ public final class KeyChainExternalSignatureParcelTest {
+             String keyAlgorithm = KeyChainExternalSignatureRequest.getKeyAlgorithm(algorithm);
+ 
+             assertTrue(digestLength >= MINIMUM_DIGEST_LENGTH_BYTES);
+-            if (algorithm == KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256
+-                    || algorithm
+-                            == KeyChainExternalSignatureRequest
+-                                    .SIGNATURE_ALGORITHM_RSA_PSS_SHA256) {
++            if (isRsaAlgorithm(algorithm)) {
+                 assertEquals(KeyProperties.KEY_ALGORITHM_RSA, keyAlgorithm);
+             } else {
+                 assertEquals(KeyProperties.KEY_ALGORITHM_EC, keyAlgorithm);
+@@ -268,6 +269,23 @@ public final class KeyChainExternalSignatureParcelTest {
+         return digest;
+     }
+ 
++    private static boolean isRsaAlgorithm(int algorithm) {
++        switch (algorithm) {
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256:
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA256:
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384:
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384:
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512:
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512:
++                return true;
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA256:
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
++                return false;
++            default:
++                throw new AssertionError("Unexpected synthetic signature algorithm");
++        }
++    }
++
+     private static KeyChainExternalSignatureRequest requestParcelRoundTrip(
+             KeyChainExternalSignatureRequest request) {
+         Parcel parcel = Parcel.obtain();
+-- 
+2.50.1 (Apple Git-155)
+

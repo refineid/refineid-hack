@@ -1,0 +1,920 @@
+From 9645cad2b64a668c186013130a90ee10e0df04eb Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 15:24:03 +0300
+Subject: [PATCH 2/2] Add external KeyChain signature contract
+
+---
+ .../android/security/IKeyChainService.aidl    |   6 +
+ .../KeyChainExternalSignatureRequest.aidl     |  20 ++
+ .../KeyChainExternalSignatureRequest.java     | 273 ++++++++++++++++
+ .../KeyChainExternalSignatureResult.aidl      |  20 ++
+ .../KeyChainExternalSignatureResult.java      | 241 ++++++++++++++
+ .../KeyChainExternalSignatureParcelTest.java  | 295 ++++++++++++++++++
+ 6 files changed, 855 insertions(+)
+ create mode 100644 keystore/java/android/security/KeyChainExternalSignatureRequest.aidl
+ create mode 100644 keystore/java/android/security/KeyChainExternalSignatureRequest.java
+ create mode 100644 keystore/java/android/security/KeyChainExternalSignatureResult.aidl
+ create mode 100644 keystore/java/android/security/KeyChainExternalSignatureResult.java
+ create mode 100644 keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+
+diff --git a/keystore/java/android/security/IKeyChainService.aidl b/keystore/java/android/security/IKeyChainService.aidl
+index da82894c..743bfff0 100644
+--- a/keystore/java/android/security/IKeyChainService.aidl
++++ b/keystore/java/android/security/IKeyChainService.aidl
+@@ -19,6 +19,8 @@ import android.content.pm.StringParceledListSlice;
+ import android.security.keymaster.KeymasterCertificateChain;
+ import android.security.keystore.ParcelableKeyGenParameterSpec;
+ import android.security.AppUriAuthenticationPolicy;
++import android.security.KeyChainExternalSignatureRequest;
++import android.security.KeyChainExternalSignatureResult;
+ import android.security.KeyChainPrivateKeyDescriptor;
+ import android.net.Uri;
+ 
+@@ -76,4 +78,8 @@ interface IKeyChainService {
+ 
+     // Typed replacement for requestPrivateKey. Appended to preserve existing transaction codes.
+     KeyChainPrivateKeyDescriptor requestPrivateKeyDescriptor(String alias);
++
++    // Exact-digest operation for a granted external key.
++    KeyChainExternalSignatureResult requestExternalSignature(
++        in KeyChainExternalSignatureRequest request);
+ }
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureRequest.aidl b/keystore/java/android/security/KeyChainExternalSignatureRequest.aidl
+new file mode 100644
+index 00000000..84e6f77c
+--- /dev/null
++++ b/keystore/java/android/security/KeyChainExternalSignatureRequest.aidl
+@@ -0,0 +1,20 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++/** @hide */
++parcelable KeyChainExternalSignatureRequest;
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureRequest.java b/keystore/java/android/security/KeyChainExternalSignatureRequest.java
+new file mode 100644
+index 00000000..b3e2172d
+--- /dev/null
++++ b/keystore/java/android/security/KeyChainExternalSignatureRequest.java
+@@ -0,0 +1,273 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++import android.annotation.IntDef;
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.os.Parcel;
++import android.os.Parcelable;
++import android.security.keystore.KeyProperties;
++
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.util.Arrays;
++import java.util.Objects;
++
++/**
++ * One exact-digest signing request for a granted external {@link KeyChain} key.
++ *
++ * @hide
++ */
++public final class KeyChainExternalSignatureRequest implements Parcelable, AutoCloseable {
++    /** RSASSA-PKCS1-v1_5 with SHA-256 and an RSA key. */
++    public static final int SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256 = 1;
++
++    /** RSASSA-PSS with SHA-256, MGF1-SHA-256, and a digest-length salt. */
++    public static final int SIGNATURE_ALGORITHM_RSA_PSS_SHA256 = 2;
++
++    /** ECDSA with a P-384 key and a SHA-256 digest. */
++    public static final int SIGNATURE_ALGORITHM_ECDSA_P384_SHA256 = 3;
++
++    /** ECDSA with a P-384 key and a SHA-384 digest. */
++    public static final int SIGNATURE_ALGORITHM_ECDSA_P384_SHA384 = 4;
++
++    /** @hide */
++    @IntDef(
++            prefix = {"SIGNATURE_ALGORITHM_"},
++            value = {
++                SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256,
++                SIGNATURE_ALGORITHM_RSA_PSS_SHA256,
++                SIGNATURE_ALGORITHM_ECDSA_P384_SHA256,
++                SIGNATURE_ALGORITHM_ECDSA_P384_SHA384
++            })
++    @Retention(RetentionPolicy.SOURCE)
++    public @interface SignatureAlgorithm {}
++
++    private static final int NO_SPECIAL_CONTENTS = 0;
++    private static final int SHA256_DIGEST_LENGTH_BITS = 256;
++    private static final int SHA384_DIGEST_LENGTH_BITS = 384;
++    private static final int SHA256_DIGEST_LENGTH_BYTES = SHA256_DIGEST_LENGTH_BITS / Byte.SIZE;
++    private static final int SHA384_DIGEST_LENGTH_BYTES = SHA384_DIGEST_LENGTH_BITS / Byte.SIZE;
++    private static final long FIRST_PROVIDER_GENERATION = 1L;
++    private static final byte CLEARED_BYTE = 0;
++
++    private final @NonNull String mExternalAlias;
++    private final @SignatureAlgorithm int mAlgorithm;
++    private final long mProviderGeneration;
++    private @Nullable byte[] mOwnedDigest;
++
++    private KeyChainExternalSignatureRequest(
++            @NonNull String externalAlias,
++            @SignatureAlgorithm int algorithm,
++            @NonNull byte[] ownedDigest,
++            long providerGeneration) {
++        Objects.requireNonNull(ownedDigest);
++        try {
++            Objects.requireNonNull(externalAlias);
++            validate(externalAlias, algorithm, ownedDigest, providerGeneration);
++        } catch (RuntimeException exception) {
++            Arrays.fill(ownedDigest, CLEARED_BYTE);
++            throw exception;
++        }
++        mExternalAlias = externalAlias;
++        mAlgorithm = algorithm;
++        mOwnedDigest = ownedDigest;
++        mProviderGeneration = providerGeneration;
++    }
++
++    private KeyChainExternalSignatureRequest(@NonNull Parcel source) {
++        this(
++                readRequiredString(source),
++                source.readInt(),
++                readRequiredByteArray(source),
++                source.readLong());
++    }
++
++    /** Creates a request and takes a defensive copy of {@code digest}. @hide */
++    @NonNull
++    public static KeyChainExternalSignatureRequest create(
++            @NonNull String externalAlias,
++            @SignatureAlgorithm int algorithm,
++            @NonNull byte[] digest,
++            long providerGeneration) {
++        return new KeyChainExternalSignatureRequest(
++                externalAlias,
++                algorithm,
++                Objects.requireNonNull(digest).clone(),
++                providerGeneration);
++    }
++
++    /** @hide */
++    @NonNull
++    public String getExternalAlias() {
++        return mExternalAlias;
++    }
++
++    /** @hide */
++    public @SignatureAlgorithm int getAlgorithm() {
++        return mAlgorithm;
++    }
++
++    /** @hide */
++    public long getProviderGeneration() {
++        return mProviderGeneration;
++    }
++
++    /** Returns a defensive copy of the exact digest. @hide */
++    @NonNull
++    public synchronized byte[] copyDigest() {
++        return requireDigest().clone();
++    }
++
++    /** Returns the exact digest length for a supported algorithm. @hide */
++    public static int getDigestLengthBytes(@SignatureAlgorithm int algorithm) {
++        switch (algorithm) {
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256:
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA256:
++            case SIGNATURE_ALGORITHM_ECDSA_P384_SHA256:
++                return SHA256_DIGEST_LENGTH_BYTES;
++            case SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
++                return SHA384_DIGEST_LENGTH_BYTES;
++            default:
++                throw new IllegalArgumentException("Unknown external signature algorithm");
++        }
++    }
++
++    /** Returns the private-key algorithm required by a supported signature. @hide */
++    @NonNull
++    public static String getKeyAlgorithm(@SignatureAlgorithm int algorithm) {
++        switch (algorithm) {
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256:
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA256:
++                return KeyProperties.KEY_ALGORITHM_RSA;
++            case SIGNATURE_ALGORITHM_ECDSA_P384_SHA256:
++            case SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
++                return KeyProperties.KEY_ALGORITHM_EC;
++            default:
++                throw new IllegalArgumentException("Unknown external signature algorithm");
++        }
++    }
++
++    @Override
++    public synchronized int describeContents() {
++        return NO_SPECIAL_CONTENTS;
++    }
++
++    @Override
++    public synchronized void writeToParcel(@NonNull Parcel destination, int flags) {
++        destination.writeString(mExternalAlias);
++        destination.writeInt(mAlgorithm);
++        destination.writeByteArray(requireDigest());
++        destination.writeLong(mProviderGeneration);
++    }
++
++    @Override
++    public synchronized void close() {
++        if (mOwnedDigest != null) {
++            Arrays.fill(mOwnedDigest, CLEARED_BYTE);
++            mOwnedDigest = null;
++        }
++    }
++
++    @Override
++    public synchronized String toString() {
++        return "KeyChainExternalSignatureRequest{"
++                + "algorithm="
++                + algorithmName(mAlgorithm)
++                + ", digestLength="
++                + getDigestLengthBytes(mAlgorithm)
++                + ", providerGeneration="
++                + mProviderGeneration
++                + ", closed="
++                + (mOwnedDigest == null)
++                + '}';
++    }
++
++    @NonNull
++    public static final Parcelable.Creator<KeyChainExternalSignatureRequest> CREATOR =
++            new Parcelable.Creator<KeyChainExternalSignatureRequest>() {
++                @Override
++                public KeyChainExternalSignatureRequest createFromParcel(Parcel source) {
++                    return new KeyChainExternalSignatureRequest(source);
++                }
++
++                @Override
++                public KeyChainExternalSignatureRequest[] newArray(int size) {
++                    return new KeyChainExternalSignatureRequest[size];
++                }
++            };
++
++    private static void validate(
++            @NonNull String externalAlias,
++            @SignatureAlgorithm int algorithm,
++            @NonNull byte[] digest,
++            long providerGeneration) {
++        if (externalAlias.isEmpty()) {
++            throw new IllegalArgumentException("External alias is empty");
++        }
++        int expectedDigestLength = getDigestLengthBytes(algorithm);
++        if (digest.length != expectedDigestLength) {
++            throw new IllegalArgumentException("External signature digest has the wrong length");
++        }
++        if (providerGeneration < FIRST_PROVIDER_GENERATION) {
++            throw new IllegalArgumentException("External provider generation must be positive");
++        }
++    }
++
++    @NonNull
++    private synchronized byte[] requireDigest() {
++        byte[] ownedDigest = mOwnedDigest;
++        if (ownedDigest == null) {
++            throw new IllegalStateException("External signature request is closed");
++        }
++        return ownedDigest;
++    }
++
++    @NonNull
++    private static String readRequiredString(@NonNull Parcel source) {
++        String value = source.readString();
++        if (value == null) {
++            throw new IllegalArgumentException("External alias is absent");
++        }
++        return value;
++    }
++
++    @NonNull
++    private static byte[] readRequiredByteArray(@NonNull Parcel source) {
++        byte[] value = source.createByteArray();
++        if (value == null) {
++            throw new IllegalArgumentException("External signature digest is absent");
++        }
++        return value;
++    }
++
++    private static String algorithmName(@SignatureAlgorithm int algorithm) {
++        switch (algorithm) {
++            case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256:
++                return "RSA_PKCS1_SHA256";
++            case SIGNATURE_ALGORITHM_RSA_PSS_SHA256:
++                return "RSA_PSS_SHA256";
++            case SIGNATURE_ALGORITHM_ECDSA_P384_SHA256:
++                return "ECDSA_P384_SHA256";
++            case SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
++                return "ECDSA_P384_SHA384";
++            default:
++                return "UNKNOWN";
++        }
++    }
++}
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureResult.aidl b/keystore/java/android/security/KeyChainExternalSignatureResult.aidl
+new file mode 100644
+index 00000000..6f0c1565
+--- /dev/null
++++ b/keystore/java/android/security/KeyChainExternalSignatureResult.aidl
+@@ -0,0 +1,20 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++/** @hide */
++parcelable KeyChainExternalSignatureResult;
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureResult.java b/keystore/java/android/security/KeyChainExternalSignatureResult.java
+new file mode 100644
+index 00000000..bb17bc32
+--- /dev/null
++++ b/keystore/java/android/security/KeyChainExternalSignatureResult.java
+@@ -0,0 +1,241 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++import android.annotation.IntDef;
++import android.annotation.NonNull;
++import android.annotation.Nullable;
++import android.os.Parcel;
++import android.os.Parcelable;
++
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.util.Arrays;
++import java.util.Objects;
++
++/**
++ * Coarse result of one external {@link KeyChain} signing request.
++ *
++ * <p>A successful RSA signature has the fixed-width JCA form. A successful ECDSA signature has the
++ * ASN.1 DER sequence form required by JCA.
++ *
++ * @hide
++ */
++public final class KeyChainExternalSignatureResult implements Parcelable, AutoCloseable {
++    /** No failure occurred. */
++    public static final int FAILURE_NONE = 0;
++
++    /** The request did not satisfy the closed external-key contract. */
++    public static final int FAILURE_INVALID_REQUEST = 1;
++
++    /** The trusted external-key provider is not currently available. */
++    public static final int FAILURE_PROVIDER_UNAVAILABLE = 2;
++
++    /** The provider changed after the private-key handle was obtained. */
++    public static final int FAILURE_PROVIDER_GENERATION_CHANGED = 3;
++
++    /** The holder cancelled authorization. */
++    public static final int FAILURE_USER_CANCELLED = 4;
++
++    /** Holder authorization timed out. */
++    public static final int FAILURE_USER_TIMED_OUT = 5;
++
++    /** The calling operation was interrupted. */
++    public static final int FAILURE_CALLER_INTERRUPTED = 6;
++
++    /** The external provider rejected or could not verify the signature operation. */
++    public static final int FAILURE_SIGNING_FAILED = 7;
++
++    /** The trusted service failed without exposing internal details. */
++    public static final int FAILURE_INTERNAL_ERROR = 8;
++
++    /** @hide */
++    @IntDef(
++            prefix = {"FAILURE_"},
++            value = {
++                FAILURE_NONE,
++                FAILURE_INVALID_REQUEST,
++                FAILURE_PROVIDER_UNAVAILABLE,
++                FAILURE_PROVIDER_GENERATION_CHANGED,
++                FAILURE_USER_CANCELLED,
++                FAILURE_USER_TIMED_OUT,
++                FAILURE_CALLER_INTERRUPTED,
++                FAILURE_SIGNING_FAILED,
++                FAILURE_INTERNAL_ERROR
++            })
++    @Retention(RetentionPolicy.SOURCE)
++    public @interface Failure {}
++
++    private static final int NO_SPECIAL_CONTENTS = 0;
++    private static final int NO_SIGNATURE_LENGTH_BYTES = 0;
++    private static final int MINIMUM_SIGNATURE_LENGTH_BYTES = 1;
++    private static final byte CLEARED_BYTE = 0;
++
++    private final @Failure int mFailure;
++    private @Nullable byte[] mOwnedSignature;
++
++    private KeyChainExternalSignatureResult(@Failure int failure, @Nullable byte[] ownedSignature) {
++        try {
++            validate(failure, ownedSignature);
++        } catch (RuntimeException exception) {
++            if (ownedSignature != null) {
++                Arrays.fill(ownedSignature, CLEARED_BYTE);
++            }
++            throw exception;
++        }
++        mFailure = failure;
++        mOwnedSignature = ownedSignature;
++    }
++
++    private KeyChainExternalSignatureResult(@NonNull Parcel source) {
++        this(source.readInt(), source.createByteArray());
++    }
++
++    /** Creates a successful result and takes a defensive copy of {@code signature}. @hide */
++    @NonNull
++    public static KeyChainExternalSignatureResult success(@NonNull byte[] signature) {
++        return new KeyChainExternalSignatureResult(
++                FAILURE_NONE, Objects.requireNonNull(signature).clone());
++    }
++
++    /** Creates a coarse failed result. @hide */
++    @NonNull
++    public static KeyChainExternalSignatureResult failure(@Failure int failure) {
++        return new KeyChainExternalSignatureResult(failure, null);
++    }
++
++    /** @hide */
++    public boolean isSuccess() {
++        return mFailure == FAILURE_NONE;
++    }
++
++    /** @hide */
++    public @Failure int getFailure() {
++        return mFailure;
++    }
++
++    /** Returns a defensive copy of a successful signature. @hide */
++    @NonNull
++    public synchronized byte[] copySignature() {
++        if (!isSuccess()) {
++            throw new IllegalStateException("External signature result is a failure");
++        }
++        byte[] ownedSignature = mOwnedSignature;
++        if (ownedSignature == null) {
++            throw new IllegalStateException("External signature result is closed");
++        }
++        return ownedSignature.clone();
++    }
++
++    @Override
++    public int describeContents() {
++        return NO_SPECIAL_CONTENTS;
++    }
++
++    @Override
++    public synchronized void writeToParcel(@NonNull Parcel destination, int flags) {
++        destination.writeInt(mFailure);
++        if (isSuccess() && mOwnedSignature == null) {
++            throw new IllegalStateException("External signature result is closed");
++        }
++        destination.writeByteArray(mOwnedSignature);
++    }
++
++    @Override
++    public synchronized void close() {
++        if (mOwnedSignature != null) {
++            Arrays.fill(mOwnedSignature, CLEARED_BYTE);
++            mOwnedSignature = null;
++        }
++    }
++
++    @Override
++    public synchronized String toString() {
++        return "KeyChainExternalSignatureResult{"
++                + "failure="
++                + failureName(mFailure)
++                + ", signatureLength="
++                + (mOwnedSignature == null ? NO_SIGNATURE_LENGTH_BYTES : mOwnedSignature.length)
++                + ", closed="
++                + (isSuccess() && mOwnedSignature == null)
++                + '}';
++    }
++
++    @NonNull
++    public static final Parcelable.Creator<KeyChainExternalSignatureResult> CREATOR =
++            new Parcelable.Creator<KeyChainExternalSignatureResult>() {
++                @Override
++                public KeyChainExternalSignatureResult createFromParcel(Parcel source) {
++                    return new KeyChainExternalSignatureResult(source);
++                }
++
++                @Override
++                public KeyChainExternalSignatureResult[] newArray(int size) {
++                    return new KeyChainExternalSignatureResult[size];
++                }
++            };
++
++    private static void validate(@Failure int failure, @Nullable byte[] signature) {
++        switch (failure) {
++            case FAILURE_NONE:
++                if (signature == null || signature.length < MINIMUM_SIGNATURE_LENGTH_BYTES) {
++                    throw new IllegalArgumentException("Successful external signature is empty");
++                }
++                return;
++            case FAILURE_INVALID_REQUEST:
++            case FAILURE_PROVIDER_UNAVAILABLE:
++            case FAILURE_PROVIDER_GENERATION_CHANGED:
++            case FAILURE_USER_CANCELLED:
++            case FAILURE_USER_TIMED_OUT:
++            case FAILURE_CALLER_INTERRUPTED:
++            case FAILURE_SIGNING_FAILED:
++            case FAILURE_INTERNAL_ERROR:
++                if (signature != null) {
++                    throw new IllegalArgumentException(
++                            "Failed external signature contains signature bytes");
++                }
++                return;
++            default:
++                throw new IllegalArgumentException("Unknown external signature failure");
++        }
++    }
++
++    private static String failureName(@Failure int failure) {
++        switch (failure) {
++            case FAILURE_NONE:
++                return "NONE";
++            case FAILURE_INVALID_REQUEST:
++                return "INVALID_REQUEST";
++            case FAILURE_PROVIDER_UNAVAILABLE:
++                return "PROVIDER_UNAVAILABLE";
++            case FAILURE_PROVIDER_GENERATION_CHANGED:
++                return "PROVIDER_GENERATION_CHANGED";
++            case FAILURE_USER_CANCELLED:
++                return "USER_CANCELLED";
++            case FAILURE_USER_TIMED_OUT:
++                return "USER_TIMED_OUT";
++            case FAILURE_CALLER_INTERRUPTED:
++                return "CALLER_INTERRUPTED";
++            case FAILURE_SIGNING_FAILED:
++                return "SIGNING_FAILED";
++            case FAILURE_INTERNAL_ERROR:
++                return "INTERNAL_ERROR";
++            default:
++                return "UNKNOWN";
++        }
++    }
++}
+diff --git a/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java b/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+new file mode 100644
+index 00000000..88e74a2c
+--- /dev/null
++++ b/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+@@ -0,0 +1,295 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.security;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertThrows;
++import static org.junit.Assert.assertTrue;
++
++import android.os.Parcel;
++import android.security.keystore.KeyProperties;
++
++import androidx.test.runner.AndroidJUnit4;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.nio.charset.StandardCharsets;
++import java.util.Arrays;
++
++/** Unit tests for the external KeyChain signature parcelables. */
++@RunWith(AndroidJUnit4.class)
++public final class KeyChainExternalSignatureParcelTest {
++    private static final String SYNTHETIC_EXTERNAL_ALIAS = "synthetic-external-alias";
++    private static final String SYNTHETIC_SIGNATURE_TEXT = "synthetic-signature";
++    private static final String EMPTY_TEXT = "";
++    private static final byte[] SYNTHETIC_SIGNATURE =
++            SYNTHETIC_SIGNATURE_TEXT.getBytes(StandardCharsets.US_ASCII);
++    private static final long SYNTHETIC_PROVIDER_GENERATION = 7L;
++    private static final long NO_PROVIDER_GENERATION = 0L;
++    private static final int UNKNOWN_SIGNATURE_ALGORITHM = Integer.MAX_VALUE;
++    private static final int UNKNOWN_FAILURE = Integer.MAX_VALUE;
++    private static final int PARCEL_START_POSITION = 0;
++    private static final int NO_REMAINING_PARCEL_BYTES = 0;
++    private static final int EMPTY_SIGNATURE_LENGTH_BYTES = 0;
++    private static final int MINIMUM_DIGEST_LENGTH_BYTES = 1;
++    private static final int FIRST_BYTE_INDEX = 0;
++    private static final int SINGLE_MISSING_BYTE_COUNT = 1;
++    private static final byte SYNTHETIC_DIGEST_FILL = 'd';
++    private static final byte MODIFIED_BYTE = 'x';
++
++    private static final int[] SUPPORTED_ALGORITHMS = {
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA256,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA256,
++        KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384
++    };
++
++    private static final int[] COARSE_FAILURES = {
++        KeyChainExternalSignatureResult.FAILURE_INVALID_REQUEST,
++        KeyChainExternalSignatureResult.FAILURE_PROVIDER_UNAVAILABLE,
++        KeyChainExternalSignatureResult.FAILURE_PROVIDER_GENERATION_CHANGED,
++        KeyChainExternalSignatureResult.FAILURE_USER_CANCELLED,
++        KeyChainExternalSignatureResult.FAILURE_USER_TIMED_OUT,
++        KeyChainExternalSignatureResult.FAILURE_CALLER_INTERRUPTED,
++        KeyChainExternalSignatureResult.FAILURE_SIGNING_FAILED,
++        KeyChainExternalSignatureResult.FAILURE_INTERNAL_ERROR
++    };
++
++    @Test
++    public void supportedAlgorithmsHaveClosedDigestAndKeyMappings() {
++        for (int algorithm : SUPPORTED_ALGORITHMS) {
++            int digestLength = KeyChainExternalSignatureRequest.getDigestLengthBytes(algorithm);
++            String keyAlgorithm = KeyChainExternalSignatureRequest.getKeyAlgorithm(algorithm);
++
++            assertTrue(digestLength >= MINIMUM_DIGEST_LENGTH_BYTES);
++            if (algorithm == KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256
++                    || algorithm
++                            == KeyChainExternalSignatureRequest
++                                    .SIGNATURE_ALGORITHM_RSA_PSS_SHA256) {
++                assertEquals(KeyProperties.KEY_ALGORITHM_RSA, keyAlgorithm);
++            } else {
++                assertEquals(KeyProperties.KEY_ALGORITHM_EC, keyAlgorithm);
++            }
++        }
++    }
++
++    @Test
++    public void requestRoundTripsAndDefensivelyCopiesDigest() {
++        int algorithm = KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384;
++        byte[] expectedDigest = syntheticDigest(algorithm);
++        byte[] inputDigest = expectedDigest.clone();
++        KeyChainExternalSignatureRequest request =
++                KeyChainExternalSignatureRequest.create(
++                        SYNTHETIC_EXTERNAL_ALIAS,
++                        algorithm,
++                        inputDigest,
++                        SYNTHETIC_PROVIDER_GENERATION);
++        inputDigest[FIRST_BYTE_INDEX] = MODIFIED_BYTE;
++
++        byte[] returnedDigest = request.copyDigest();
++        assertArrayEquals(expectedDigest, returnedDigest);
++        returnedDigest[FIRST_BYTE_INDEX] = MODIFIED_BYTE;
++
++        KeyChainExternalSignatureRequest restored = requestParcelRoundTrip(request);
++
++        assertEquals(SYNTHETIC_EXTERNAL_ALIAS, restored.getExternalAlias());
++        assertEquals(algorithm, restored.getAlgorithm());
++        assertArrayEquals(expectedDigest, restored.copyDigest());
++        assertEquals(SYNTHETIC_PROVIDER_GENERATION, restored.getProviderGeneration());
++        request.close();
++        restored.close();
++        Arrays.fill(expectedDigest, MODIFIED_BYTE);
++    }
++
++    @Test
++    public void requestRejectsMalformedFieldsAndUseAfterClose() {
++        int algorithm = KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256;
++        byte[] digest = syntheticDigest(algorithm);
++        byte[] shortDigest = Arrays.copyOf(digest, digest.length - SINGLE_MISSING_BYTE_COUNT);
++
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainExternalSignatureRequest.create(
++                                EMPTY_TEXT, algorithm, digest, SYNTHETIC_PROVIDER_GENERATION));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainExternalSignatureRequest.create(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                UNKNOWN_SIGNATURE_ALGORITHM,
++                                digest,
++                                SYNTHETIC_PROVIDER_GENERATION));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainExternalSignatureRequest.create(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                algorithm,
++                                shortDigest,
++                                SYNTHETIC_PROVIDER_GENERATION));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainExternalSignatureRequest.create(
++                                SYNTHETIC_EXTERNAL_ALIAS,
++                                algorithm,
++                                digest,
++                                NO_PROVIDER_GENERATION));
++
++        KeyChainExternalSignatureRequest request =
++                KeyChainExternalSignatureRequest.create(
++                        SYNTHETIC_EXTERNAL_ALIAS, algorithm, digest, SYNTHETIC_PROVIDER_GENERATION);
++        request.close();
++        assertThrows(IllegalStateException.class, request::copyDigest);
++        Arrays.fill(digest, MODIFIED_BYTE);
++        Arrays.fill(shortDigest, MODIFIED_BYTE);
++    }
++
++    @Test
++    public void requestParcelRejectsUnknownAlgorithm() {
++        Parcel parcel = Parcel.obtain();
++        try {
++            parcel.writeString(SYNTHETIC_EXTERNAL_ALIAS);
++            parcel.writeInt(UNKNOWN_SIGNATURE_ALGORITHM);
++            parcel.writeByteArray(
++                    syntheticDigest(
++                            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256));
++            parcel.writeLong(SYNTHETIC_PROVIDER_GENERATION);
++            parcel.setDataPosition(PARCEL_START_POSITION);
++
++            assertThrows(
++                    IllegalArgumentException.class,
++                    () -> KeyChainExternalSignatureRequest.CREATOR.createFromParcel(parcel));
++        } finally {
++            parcel.recycle();
++        }
++    }
++
++    @Test
++    public void successResultRoundTripsAndDefensivelyCopiesSignature() {
++        byte[] expectedSignature = SYNTHETIC_SIGNATURE.clone();
++        byte[] inputSignature = expectedSignature.clone();
++        KeyChainExternalSignatureResult result =
++                KeyChainExternalSignatureResult.success(inputSignature);
++        inputSignature[FIRST_BYTE_INDEX] = MODIFIED_BYTE;
++
++        byte[] returnedSignature = result.copySignature();
++        assertArrayEquals(expectedSignature, returnedSignature);
++        returnedSignature[FIRST_BYTE_INDEX] = MODIFIED_BYTE;
++
++        KeyChainExternalSignatureResult restored = resultParcelRoundTrip(result);
++
++        assertTrue(restored.isSuccess());
++        assertEquals(KeyChainExternalSignatureResult.FAILURE_NONE, restored.getFailure());
++        assertArrayEquals(expectedSignature, restored.copySignature());
++        result.close();
++        restored.close();
++        assertThrows(IllegalStateException.class, result::copySignature);
++        Arrays.fill(expectedSignature, MODIFIED_BYTE);
++    }
++
++    @Test
++    public void everyCoarseFailureRoundTripsWithoutSignatureBytes() {
++        for (int failure : COARSE_FAILURES) {
++            KeyChainExternalSignatureResult result =
++                    KeyChainExternalSignatureResult.failure(failure);
++            KeyChainExternalSignatureResult restored = resultParcelRoundTrip(result);
++
++            assertFalse(restored.isSuccess());
++            assertEquals(failure, restored.getFailure());
++            assertThrows(IllegalStateException.class, restored::copySignature);
++            result.close();
++            restored.close();
++        }
++    }
++
++    @Test
++    public void resultRejectsEmptySuccessNoneFailureAndUnknownFailure() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainExternalSignatureResult.success(
++                                new byte[EMPTY_SIGNATURE_LENGTH_BYTES]));
++        assertThrows(
++                IllegalArgumentException.class,
++                () ->
++                        KeyChainExternalSignatureResult.failure(
++                                KeyChainExternalSignatureResult.FAILURE_NONE));
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> KeyChainExternalSignatureResult.failure(UNKNOWN_FAILURE));
++    }
++
++    @Test
++    public void stringFormsOmitAliasDigestAndSignatureMaterial() {
++        int algorithm = KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256;
++        byte[] digest = syntheticDigest(algorithm);
++        String digestText = new String(digest, StandardCharsets.US_ASCII);
++        KeyChainExternalSignatureRequest request =
++                KeyChainExternalSignatureRequest.create(
++                        SYNTHETIC_EXTERNAL_ALIAS, algorithm, digest, SYNTHETIC_PROVIDER_GENERATION);
++        KeyChainExternalSignatureResult result =
++                KeyChainExternalSignatureResult.success(SYNTHETIC_SIGNATURE);
++
++        assertFalse(request.toString().contains(SYNTHETIC_EXTERNAL_ALIAS));
++        assertFalse(request.toString().contains(digestText));
++        assertFalse(result.toString().contains(SYNTHETIC_SIGNATURE_TEXT));
++        request.close();
++        result.close();
++        Arrays.fill(digest, MODIFIED_BYTE);
++    }
++
++    private static byte[] syntheticDigest(int algorithm) {
++        byte[] digest = new byte[KeyChainExternalSignatureRequest.getDigestLengthBytes(algorithm)];
++        Arrays.fill(digest, SYNTHETIC_DIGEST_FILL);
++        return digest;
++    }
++
++    private static KeyChainExternalSignatureRequest requestParcelRoundTrip(
++            KeyChainExternalSignatureRequest request) {
++        Parcel parcel = Parcel.obtain();
++        try {
++            request.writeToParcel(parcel, request.describeContents());
++            parcel.setDataPosition(PARCEL_START_POSITION);
++            KeyChainExternalSignatureRequest restored =
++                    KeyChainExternalSignatureRequest.CREATOR.createFromParcel(parcel);
++            assertEquals(NO_REMAINING_PARCEL_BYTES, parcel.dataAvail());
++            return restored;
++        } finally {
++            parcel.recycle();
++        }
++    }
++
++    private static KeyChainExternalSignatureResult resultParcelRoundTrip(
++            KeyChainExternalSignatureResult result) {
++        Parcel parcel = Parcel.obtain();
++        try {
++            result.writeToParcel(parcel, result.describeContents());
++            parcel.setDataPosition(PARCEL_START_POSITION);
++            KeyChainExternalSignatureResult restored =
++                    KeyChainExternalSignatureResult.CREATOR.createFromParcel(parcel);
++            assertEquals(NO_REMAINING_PARCEL_BYTES, parcel.dataAvail());
++            return restored;
++        } finally {
++            parcel.recycle();
++        }
++    }
++}

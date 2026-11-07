@@ -1,0 +1,227 @@
+From e528871ff8aa20a72d98f6062457d88efbe48b1d Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 16:40:55 +0300
+Subject: [PATCH 5/5] Carry caller liveness through external signing
+
+---
+ .../KeyChainExternalSignatureRequest.java     | 94 +++++++++++++++----
+ .../KeyChainExternalSignatureParcelTest.java  |  5 +
+ 2 files changed, 82 insertions(+), 17 deletions(-)
+
+diff --git a/keystore/java/android/security/KeyChainExternalSignatureRequest.java b/keystore/java/android/security/KeyChainExternalSignatureRequest.java
+index b3e2172d..a8fe4bdb 100644
+--- a/keystore/java/android/security/KeyChainExternalSignatureRequest.java
++++ b/keystore/java/android/security/KeyChainExternalSignatureRequest.java
+@@ -19,6 +19,8 @@ package android.security;
+ import android.annotation.IntDef;
+ import android.annotation.NonNull;
+ import android.annotation.Nullable;
++import android.os.Binder;
++import android.os.IBinder;
+ import android.os.Parcel;
+ import android.os.Parcelable;
+ import android.security.keystore.KeyProperties;
+@@ -69,17 +71,24 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+     private final @NonNull String mExternalAlias;
+     private final @SignatureAlgorithm int mAlgorithm;
+     private final long mProviderGeneration;
++    private final @NonNull IBinder mOperationToken;
+     private @Nullable byte[] mOwnedDigest;
+ 
+     private KeyChainExternalSignatureRequest(
+             @NonNull String externalAlias,
+             @SignatureAlgorithm int algorithm,
+             @NonNull byte[] ownedDigest,
+-            long providerGeneration) {
++            long providerGeneration,
++            @NonNull IBinder operationToken) {
+         Objects.requireNonNull(ownedDigest);
+         try {
+             Objects.requireNonNull(externalAlias);
+-            validate(externalAlias, algorithm, ownedDigest, providerGeneration);
++            validate(
++                    externalAlias,
++                    algorithm,
++                    ownedDigest,
++                    providerGeneration,
++                    operationToken);
+         } catch (RuntimeException exception) {
+             Arrays.fill(ownedDigest, CLEARED_BYTE);
+             throw exception;
+@@ -88,14 +97,7 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         mAlgorithm = algorithm;
+         mOwnedDigest = ownedDigest;
+         mProviderGeneration = providerGeneration;
+-    }
+-
+-    private KeyChainExternalSignatureRequest(@NonNull Parcel source) {
+-        this(
+-                readRequiredString(source),
+-                source.readInt(),
+-                readRequiredByteArray(source),
+-                source.readLong());
++        mOperationToken = operationToken;
+     }
+ 
+     /** Creates a request and takes a defensive copy of {@code digest}. @hide */
+@@ -105,11 +107,23 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+             @SignatureAlgorithm int algorithm,
+             @NonNull byte[] digest,
+             long providerGeneration) {
+-        return new KeyChainExternalSignatureRequest(
+-                externalAlias,
+-                algorithm,
+-                Objects.requireNonNull(digest).clone(),
+-                providerGeneration);
++        byte[] ownedDigest = Objects.requireNonNull(digest).clone();
++        boolean ownershipTransferred = false;
++        try {
++            KeyChainExternalSignatureRequest request =
++                    new KeyChainExternalSignatureRequest(
++                            externalAlias,
++                            algorithm,
++                            ownedDigest,
++                            providerGeneration,
++                            new Binder());
++            ownershipTransferred = true;
++            return request;
++        } finally {
++            if (!ownershipTransferred) {
++                Arrays.fill(ownedDigest, CLEARED_BYTE);
++            }
++        }
+     }
+ 
+     /** @hide */
+@@ -128,6 +142,14 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         return mProviderGeneration;
+     }
+ 
++    /**
++     * Returns a caller-process liveness token. The token is not trusted as caller identity. @hide
++     */
++    @NonNull
++    public IBinder getOperationToken() {
++        return mOperationToken;
++    }
++
+     /** Returns a defensive copy of the exact digest. @hide */
+     @NonNull
+     public synchronized byte[] copyDigest() {
+@@ -174,6 +196,7 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         destination.writeInt(mAlgorithm);
+         destination.writeByteArray(requireDigest());
+         destination.writeLong(mProviderGeneration);
++        destination.writeStrongBinder(mOperationToken);
+     }
+ 
+     @Override
+@@ -203,7 +226,7 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+             new Parcelable.Creator<KeyChainExternalSignatureRequest>() {
+                 @Override
+                 public KeyChainExternalSignatureRequest createFromParcel(Parcel source) {
+-                    return new KeyChainExternalSignatureRequest(source);
++                    return readFromParcel(source);
+                 }
+ 
+                 @Override
+@@ -212,11 +235,38 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+                 }
+             };
+ 
++    @NonNull
++    private static KeyChainExternalSignatureRequest readFromParcel(@NonNull Parcel source) {
++        byte[] ownedDigest = null;
++        boolean ownershipTransferred = false;
++        try {
++            String externalAlias = readRequiredString(source);
++            int algorithm = source.readInt();
++            ownedDigest = readRequiredByteArray(source);
++            long providerGeneration = source.readLong();
++            IBinder operationToken = readRequiredBinder(source);
++            KeyChainExternalSignatureRequest request =
++                    new KeyChainExternalSignatureRequest(
++                            externalAlias,
++                            algorithm,
++                            ownedDigest,
++                            providerGeneration,
++                            operationToken);
++            ownershipTransferred = true;
++            return request;
++        } finally {
++            if (!ownershipTransferred && ownedDigest != null) {
++                Arrays.fill(ownedDigest, CLEARED_BYTE);
++            }
++        }
++    }
++
+     private static void validate(
+             @NonNull String externalAlias,
+             @SignatureAlgorithm int algorithm,
+             @NonNull byte[] digest,
+-            long providerGeneration) {
++            long providerGeneration,
++            @NonNull IBinder operationToken) {
+         if (externalAlias.isEmpty()) {
+             throw new IllegalArgumentException("External alias is empty");
+         }
+@@ -227,6 +277,7 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         if (providerGeneration < FIRST_PROVIDER_GENERATION) {
+             throw new IllegalArgumentException("External provider generation must be positive");
+         }
++        Objects.requireNonNull(operationToken);
+     }
+ 
+     @NonNull
+@@ -256,6 +307,15 @@ public final class KeyChainExternalSignatureRequest implements Parcelable, AutoC
+         return value;
+     }
+ 
++    @NonNull
++    private static IBinder readRequiredBinder(@NonNull Parcel source) {
++        IBinder value = source.readStrongBinder();
++        if (value == null) {
++            throw new IllegalArgumentException("External operation token is absent");
++        }
++        return value;
++    }
++
+     private static String algorithmName(@SignatureAlgorithm int algorithm) {
+         switch (algorithm) {
+             case SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256:
+diff --git a/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java b/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+index 88e74a2c..31ddd70c 100644
+--- a/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
++++ b/keystore/tests/src/android/security/KeyChainExternalSignatureParcelTest.java
+@@ -19,9 +19,11 @@ package android.security;
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertThrows;
+ import static org.junit.Assert.assertTrue;
+ 
++import android.os.Binder;
+ import android.os.Parcel;
+ import android.security.keystore.KeyProperties;
+ 
+@@ -113,6 +115,8 @@ public final class KeyChainExternalSignatureParcelTest {
+         assertEquals(algorithm, restored.getAlgorithm());
+         assertArrayEquals(expectedDigest, restored.copyDigest());
+         assertEquals(SYNTHETIC_PROVIDER_GENERATION, restored.getProviderGeneration());
++        assertNotNull(request.getOperationToken());
++        assertEquals(request.getOperationToken(), restored.getOperationToken());
+         request.close();
+         restored.close();
+         Arrays.fill(expectedDigest, MODIFIED_BYTE);
+@@ -173,6 +177,7 @@ public final class KeyChainExternalSignatureParcelTest {
+                     syntheticDigest(
+                             KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256));
+             parcel.writeLong(SYNTHETIC_PROVIDER_GENERATION);
++            parcel.writeStrongBinder(new Binder());
+             parcel.setDataPosition(PARCEL_START_POSITION);
+ 
+             assertThrows(
+-- 
+2.50.1 (Apple Git-155)
+

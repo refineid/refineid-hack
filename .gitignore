@@ -2,4 +2,5 @@
 #   swiftc -O -o kcdump kcdump.swift -framework Security
 /kcdump
 __pycache__/
+/aosp-keychain-external-key/aosp-prebuilt/
 *.py[cod]

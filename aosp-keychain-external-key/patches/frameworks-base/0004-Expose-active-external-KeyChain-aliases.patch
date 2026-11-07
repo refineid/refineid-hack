@@ -1,0 +1,25 @@
+From ee79b443f7baa8d28cb32e6fcd2364345ab00469 Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 15:56:29 +0300
+Subject: [PATCH 4/4] Expose active external KeyChain aliases
+
+---
+ keystore/java/android/security/IKeyChainService.aidl | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/keystore/java/android/security/IKeyChainService.aidl b/keystore/java/android/security/IKeyChainService.aidl
+index 743bfff0..2bcef97b 100644
+--- a/keystore/java/android/security/IKeyChainService.aidl
++++ b/keystore/java/android/security/IKeyChainService.aidl
+@@ -82,4 +82,8 @@ interface IKeyChainService {
+     // Exact-digest operation for a granted external key.
+     KeyChainExternalSignatureResult requestExternalSignature(
+         in KeyChainExternalSignatureRequest request);
++
++    // Dynamically available external aliases for KeyChainActivity.
++    // Appended to preserve existing transaction codes.
++    StringParceledListSlice getExternalKeyAliases();
+ }
+-- 
+2.50.1 (Apple Git-155)
+

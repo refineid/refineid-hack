@@ -4,6 +4,9 @@ hack: written to try something out, kept because it was useful once, and
 not maintained to the standard of the RefineID applications. Read
 `SECURITY.md` before taking anything here seriously.
 
+`aosp-keychain-external-key/` is the parked AOSP KeyChain patch series moved
+from refineid-android; its own README says what it is and what it needs.
+
 `fetch_suomi_occupation.sh` implements a self-contained suomi.fi login chain over an
 SSHed host and fetches `value.profession` from the authenticated personal-data API.
 

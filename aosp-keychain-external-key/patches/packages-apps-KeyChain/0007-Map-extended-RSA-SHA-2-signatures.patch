@@ -1,0 +1,78 @@
+From a38cc1d7f9b5542593ea48fb193a9cdceb7a4e8b Mon Sep 17 00:00:00 2001
+From: Petri Koistinen <petri.koistinen@refineid.fi>
+Date: Sat, 15 Aug 2026 23:30:02 +0300
+Subject: [PATCH] Map extended RSA SHA-2 signatures
+
+---
+ .../keychain/BoundExternalKeyProvider.java    |  8 +++++++
+ .../BoundExternalKeyProviderTest.java         | 21 ++++++++++++++++---
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/src/com/android/keychain/BoundExternalKeyProvider.java b/src/com/android/keychain/BoundExternalKeyProvider.java
+index 8d83ed4..73afec2 100644
+--- a/src/com/android/keychain/BoundExternalKeyProvider.java
++++ b/src/com/android/keychain/BoundExternalKeyProvider.java
+@@ -195,6 +195,14 @@ final class BoundExternalKeyProvider implements ExternalKeyProvider {
+                 return IExternalKeyProviderService.SIGNATURE_ALGORITHM_ECDSA_P384_SHA256;
+             case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384:
+                 return IExternalKeyProviderService.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384;
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384:
++                return IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384;
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384:
++                return IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PSS_SHA384;
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512:
++                return IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512;
++            case KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512:
++                return IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PSS_SHA512;
+             default:
+                 throw new IllegalArgumentException("Unknown external signature algorithm");
+         }
+diff --git a/tests/src/com/android/keychain/BoundExternalKeyProviderTest.java b/tests/src/com/android/keychain/BoundExternalKeyProviderTest.java
+index fc56168..048c682 100644
+--- a/tests/src/com/android/keychain/BoundExternalKeyProviderTest.java
++++ b/tests/src/com/android/keychain/BoundExternalKeyProviderTest.java
+@@ -17,6 +17,7 @@
+ package com.android.keychain;
+ 
+ import static com.google.common.truth.Truth.assertThat;
++
+ import static org.junit.Assert.assertThrows;
+ 
+ import android.content.pm.ApplicationInfo;
+@@ -78,6 +79,22 @@ public final class BoundExternalKeyProviderTest {
+         {
+             KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384,
+             IExternalKeyProviderService.SIGNATURE_ALGORITHM_ECDSA_P384_SHA384
++        },
++        {
++            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384,
++            IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA384
++        },
++        {
++            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA384,
++            IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PSS_SHA384
++        },
++        {
++            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512,
++            IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA512
++        },
++        {
++            KeyChainExternalSignatureRequest.SIGNATURE_ALGORITHM_RSA_PSS_SHA512,
++            IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PSS_SHA512
+         }
+     };
+ 
+@@ -151,9 +168,7 @@ public final class BoundExternalKeyProviderTest {
+             assertThat(service.mObservedAlias).isEqualTo(ExternalKeyManager.KEYCHAIN_ALIAS);
+             assertThat(service.mObservedGeneration).isEqualTo(SYNTHETIC_PROVIDER_GENERATION);
+             assertThat(service.mObservedAlgorithm)
+-                    .isEqualTo(
+-                            IExternalKeyProviderService
+-                                    .SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
++                    .isEqualTo(IExternalKeyProviderService.SIGNATURE_ALGORITHM_RSA_PKCS1_SHA256);
+             assertThat(service.mObservedDigest).isEqualTo(digest);
+             assertThat(service.mObservedOperationToken).isEqualTo(request.getOperationToken());
+         } finally {
+-- 
+2.50.1 (Apple Git-155)
+
