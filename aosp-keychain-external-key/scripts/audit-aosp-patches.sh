@@ -87,6 +87,8 @@ fi
 series_status="$(git -C "$SERIES_ROOT" status --porcelain --untracked-files=normal -- .)"
 [[ -z "$series_status" ]] ||
   fail "AOSP patch audit requires a clean committed patch series"
+series_repository="$(git -C "$SERIES_ROOT" rev-parse --show-toplevel)"
+readonly series_repository
 series_prefix="$(git -C "$SERIES_ROOT" rev-parse --show-prefix)"
 readonly series_prefix
 
@@ -96,7 +98,8 @@ trap cleanup EXIT
 audit_series="$audit_root/$REFINEID_RELATIVE_PATH"
 readonly audit_series
 mkdir -p "$audit_series" "$audit_root/frameworks" "$audit_root/device/google"
-git -C "$SERIES_ROOT" archive --format=tar "HEAD:${series_prefix%/}" |
+# git archive limits itself to the current directory, so it runs from the top.
+git -C "$series_repository" archive --format=tar "HEAD:${series_prefix%/}" |
   tar -x -C "$audit_series"
 
 clone_sparse_project "$FRAMEWORKS_BASE_UPSTREAM" "$audit_root/$FRAMEWORKS_BASE_RELATIVE_PATH" \
