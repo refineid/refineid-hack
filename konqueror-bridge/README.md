@@ -48,6 +48,17 @@ Chromium's `--ignore-certificate-errors-spki-list`, and only in Konqueror.
 Anything that runs as the user can read those files and use the proxy. It still
 cannot get PIN 1 or the card's key out of it.
 
+## Known limits
+
+- Plain `http://` pages fail: the proxy answers only CONNECT.
+- The patch trusts whatever listens on the port. Another local user who binds it
+  first receives the proxy secret.
+- A reader token whose key fails to load does not fall back to the phone token.
+- The first certificate and first key of a token are paired without a check.
+- A missing `cert.pem` beside an existing `key.pem` stops the proxy until the
+  directory is removed.
+- Connections and threads are unbounded.
+
 ## Install
 
 ```sh
