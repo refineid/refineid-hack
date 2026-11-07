@@ -1,0 +1,451 @@
+diff --git b/.gitattributes a/.gitattributes
+index 675eb83..bcbe131 100644
+--- b/.gitattributes
++++ a/.gitattributes
+@@ -3,6 +3,8 @@
+ *.sh text eol=lf
+ .githooks/** text eol=lf
+ gradlew text eol=lf
++*.aidl text eol=lf
++app/src/main/java/com/android/keychain/external/*.java text eol=lf
+ 
+ # A Windows batch file keeps the CRLF it is committed with.
+ gradlew.bat -text
+diff --git b/app/build.gradle.kts a/app/build.gradle.kts
+index 552120f..b3ae700 100644
+--- b/app/build.gradle.kts
++++ a/app/build.gradle.kts
+@@ -207,6 +207,7 @@ android {
+     }
+ 
+     buildFeatures {
++        aidl = true
+         compose = true
+         buildConfig = true
+     }
+diff --git b/app/src/debug/java/fi/refineid/android/diagnostics/AppTrace.kt a/app/src/debug/java/fi/refineid/android/diagnostics/AppTrace.kt
+index 3d43ad1..bd3ebe1 100644
+--- b/app/src/debug/java/fi/refineid/android/diagnostics/AppTrace.kt
++++ a/app/src/debug/java/fi/refineid/android/diagnostics/AppTrace.kt
+@@ -24,6 +24,8 @@ import fi.refineid.android.document.QualifiedPdfArchivalResult
+ import fi.refineid.android.document.QualifiedPdfArchivalStage
+ import fi.refineid.android.document.QualifiedPdfPreparationResult
+ import fi.refineid.android.document.QualifiedPdfSigningResult
++import fi.refineid.android.keychain.ExternalKeyPinAuthorization
++import fi.refineid.android.keychain.ExternalKeySignResult
+ import fi.refineid.android.network.SigningTimestampAttemptOutcome
+ import fi.refineid.android.nfc.NfcReaderStatus
+ import fi.refineid.android.rapp.RappBleGattEvent
+@@ -62,6 +64,50 @@ internal object AppTrace {
+         debug("app:activity-destroyed")
+     }
+ 
++    fun externalKeyProviderServiceCreated() {
++        debug("external-key:service-created")
++    }
++
++    fun externalKeyProviderServiceBound(isAccepted: Boolean) {
++        debug("external-key:service-bind accepted=" + isAccepted)
++    }
++
++    fun externalKeyProviderServiceDestroyed() {
++        debug("external-key:service-destroyed")
++    }
++
++    fun externalKeyIdentityQueried(isAvailable: Boolean) {
++        debug("external-key:identity-query available=" + isAvailable)
++    }
++
++    fun externalKeySignStarted(algorithm: AuthenticationSigningAlgorithm) {
++        debug("external-key:sign-started algorithm=" + algorithm)
++    }
++
++    fun externalKeySignCompleted(result: ExternalKeySignResult) {
++        debug("external-key:sign-completed result=" + result)
++    }
++
++    fun externalKeyIdentityRemovalCompleted(isRemoved: Boolean) {
++        debug("external-key:identity-removal removed=" + isRemoved)
++    }
++
++    fun externalKeyPinPromptDispatched() {
++        debug("external-key:pin-prompt-dispatched")
++    }
++
++    fun externalKeyPinPromptCompleted(authorization: ExternalKeyPinAuthorization) {
++        val outcome =
++            when (authorization) {
++                is ExternalKeyPinAuthorization.Approved -> "approved"
++                ExternalKeyPinAuthorization.Cancelled -> "cancelled"
++                ExternalKeyPinAuthorization.TimedOut -> "timed-out"
++                ExternalKeyPinAuthorization.Interrupted -> "interrupted"
++                ExternalKeyPinAuthorization.Unavailable -> "unavailable"
++            }
++        debug("external-key:pin-prompt-completed outcome=" + outcome)
++    }
++
+     fun nativeLibraryLoadCompleted(isSuccessful: Boolean) {
+         debug("native:library-loaded successful=" + isSuccessful)
+     }
+diff --git b/app/src/main/AndroidManifest.xml a/app/src/main/AndroidManifest.xml
+index d6adbff..f6a55af 100644
+--- b/app/src/main/AndroidManifest.xml
++++ a/app/src/main/AndroidManifest.xml
+@@ -28,6 +28,10 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+     <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
++    <!-- Product images sign this APK with the platform key; see ADR 0027. -->
++    <uses-permission
++        android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND"
++        tools:ignore="ProtectedPermissions" />
+ 
+     <application
+         android:name=".RefineIdApplication"
+@@ -42,6 +46,26 @@
+         android:theme="@style/Theme.RefineID"
+         android:networkSecurityConfig="@xml/network_security_config"
+         android:usesCleartextTraffic="false">
++        <!-- The PIN prompt takes the orientation of the browser beneath it (design record 0045). -->
++        <activity
++            android:name=".keychain.ExternalKeyPinActivity"
++            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden"
++            android:excludeFromRecents="true"
++            android:exported="false"
++            android:finishOnTaskLaunch="true"
++            android:launchMode="singleTop"
++            android:screenOrientation="behind"
++            tools:ignore="DiscouragedApi,LockedOrientationActivity" />
++
++        <service
++            android:name=".keychain.ExternalKeyProviderService"
++            android:exported="true"
++            android:permission="com.android.keychain.permission.BIND_EXTERNAL_KEY_PROVIDER">
++            <intent-filter>
++                <action android:name="com.android.keychain.external.IExternalKeyProviderService" />
++            </intent-filter>
++        </service>
++
+         <!-- MainActivity is the system launcher entrypoint and must be exported for the OS launcher -->
+         <!-- The main screen stays in portrait on phones; large screens running
+              Android 16 or later ignore the request and lay the screen out as the
+diff --git b/app/src/main/java/fi/refineid/android/RefineIdApplication.kt a/app/src/main/java/fi/refineid/android/RefineIdApplication.kt
+index 6d301a8..5e95797 100644
+--- b/app/src/main/java/fi/refineid/android/RefineIdApplication.kt
++++ a/app/src/main/java/fi/refineid/android/RefineIdApplication.kt
+@@ -3,9 +3,14 @@
+ package fi.refineid.android
+ 
+ import android.app.Application
++import fi.refineid.android.core.AuthenticationCardIdentity
+ import fi.refineid.android.core.AuthenticationPinCache
+ import fi.refineid.android.core.NativeCardCa
+ import fi.refineid.android.core.Pin1Retention
++import fi.refineid.android.keychain.AndroidExternalKeyCallerLabelResolver
++import fi.refineid.android.keychain.ExternalKeyPinPromptBroker
++import fi.refineid.android.keychain.ExternalKeyProviderRuntime
++import fi.refineid.android.keychain.TransportSelectingCardSession
+ import fi.refineid.android.nfc.NfcReaderController
+ import fi.refineid.android.prime.PrimedCanStore
+ import fi.refineid.android.settings.TimestampAuthorityStore
+@@ -85,6 +90,10 @@ class RefineIdApplication : Application() {
+             }
+     }
+ 
++    internal lateinit var pinPromptBroker: ExternalKeyPinPromptBroker
++        private set
++    internal lateinit var externalKeyProviderRuntime: ExternalKeyProviderRuntime
++        private set
+     internal lateinit var timestampAuthorityStore: TimestampAuthorityStore
+         private set
+     internal lateinit var rappAuthorizationInbox: fi.refineid.android.rapp.RappAuthorizationInbox
+@@ -196,6 +205,30 @@ class RefineIdApplication : Application() {
+                 vault = rappVault,
+                 catalog = rappPairCatalog,
+             )
++        val externalKeyCardSession =
++            TransportSelectingCardSession(
++                listOf(
++                    readerController.externalKeyCardSession,
++                    nfcReaderController.externalKeyCardSession,
++                ),
++            )
++        pinPromptBroker =
++            ExternalKeyPinPromptBroker(
++                context = this,
++                callerLabelResolver = AndroidExternalKeyCallerLabelResolver(packageManager),
++                pinCache = authenticationPinCache,
++                cardFor = { generation ->
++                    externalKeyCardSession.copyIdentity(generation)?.use { identity ->
++                        AuthenticationCardIdentity.of(identity.certificate)
++                    }
++                },
++            )
++        externalKeyProviderRuntime =
++            ExternalKeyProviderRuntime(
++                cardSession = externalKeyCardSession,
++                pinAuthorizer = pinPromptBroker,
++                issuerCertificateSource = caStore,
++            )
+         val readerCardPresence = ReaderCardPresenceWatch()
+         readerController.addStateListener { snapshot ->
+             if (readerCardPresence.presenceEnded(snapshot)) forgetReaderPin1()
+@@ -245,6 +278,7 @@ class RefineIdApplication : Application() {
+ 
+     override fun onTerminate() {
+         rappProxyDispatcher.close()
++        externalKeyProviderRuntime.close()
+         nfcReaderController.stop()
+         readerController.stop()
+         super.onTerminate()
+diff --git b/app/src/main/java/fi/refineid/android/nfc/NfcReaderController.kt a/app/src/main/java/fi/refineid/android/nfc/NfcReaderController.kt
+index d776065..f716006 100644
+--- b/app/src/main/java/fi/refineid/android/nfc/NfcReaderController.kt
++++ a/app/src/main/java/fi/refineid/android/nfc/NfcReaderController.kt
+@@ -28,11 +28,13 @@ import fi.refineid.android.core.NativeContactlessSession
+ import fi.refineid.android.core.PersonCardDetails
+ import fi.refineid.android.core.Pin1Submission
+ import fi.refineid.android.diagnostics.AppTrace
++import fi.refineid.android.keychain.nextProviderGeneration
+ import fi.refineid.android.prime.PrimedCanStore
+ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.withTimeoutOrNull
+ import java.io.IOException
++import java.security.SecureRandom
+ import java.util.concurrent.ExecutorService
+ import java.util.concurrent.Executors
+ import java.util.concurrent.RejectedExecutionException
+@@ -96,6 +98,8 @@ internal class NfcReaderController(
+ 
+     // Worker-thread confined. Main-thread state never owns a session.
+     private var activeSession: ContactlessSession? = null
++    private var activeProviderGeneration: Long? = null
++    private val providerGenerationRandom = SecureRandom()
+ 
+     private val isOpeningSession = AtomicBoolean(false)
+ 
+@@ -179,6 +183,24 @@ internal class NfcReaderController(
+             activeSession = { activeSession },
+         )
+ 
++    internal val externalKeyCardSession =
++        NfcExternalKeyCardSession(
++            probeExecutor = probeExecutor,
++            isAvailable = { latestSnapshot.status == NfcReaderStatus.CARD_READY },
++            activeSession = { activeSession },
++            activeProviderGeneration = { activeProviderGeneration },
++            onCardLost = {
++                val generation = probeGeneration
++                val sessionWasActive = activeSession != null
++                closeActiveSession()
++                publishAsync(
++                    generation,
++                    NfcReaderStatus.WAITING_FOR_CARD,
++                    awaitingCard = sessionWasActive,
++                )
++            },
++        )
++
+     private val adapterStateReceiver =
+         object : BroadcastReceiver() {
+             override fun onReceive(
+@@ -718,6 +740,7 @@ internal class NfcReaderController(
+                 material = material,
+                 heldSession = true,
+             )
++        activeProviderGeneration = providerGenerationRandom.nextProviderGeneration()
+         feedback.onCardSuccess()
+         publishAsync(generation, NfcReaderStatus.CARD_READY, holderName = holderName, cardDetails = cardDetails)
+     }
+@@ -753,6 +776,7 @@ internal class NfcReaderController(
+                 material = material,
+                 heldSession = true,
+             )
++        activeProviderGeneration = providerGenerationRandom.nextProviderGeneration()
+         feedback.onCardSuccess()
+         publishAsync(generation, NfcReaderStatus.ACTIVATION_REQUIRED, holderName = null, cardDetails = null)
+     }
+@@ -896,6 +920,7 @@ internal class NfcReaderController(
+     }
+ 
+     private fun closeActiveSession() {
++        activeProviderGeneration = null
+         currentAuthCertDer = null
+         activeSession?.close()
+         activeSession = null
+diff --git b/app/src/main/java/fi/refineid/android/ui/UiAutomationIds.kt a/app/src/main/java/fi/refineid/android/ui/UiAutomationIds.kt
+index 817f000..83c1529 100644
+--- b/app/src/main/java/fi/refineid/android/ui/UiAutomationIds.kt
++++ a/app/src/main/java/fi/refineid/android/ui/UiAutomationIds.kt
+@@ -62,6 +62,11 @@ internal object UiAutomationIds {
+     const val BROWSER_UNLOCK_ACTION = "browserUnlockAction"
+     const val BROWSER_UNLOCK_CANCEL_ACTION = "browserUnlockCancelAction"
+     const val BROWSER_SIGN_ACTION = "browserSignAction"
++    const val EXTERNAL_KEY_PIN_SCREEN = "externalKeyPinScreen"
++    const val EXTERNAL_KEY_CALLER = "externalKeyCaller"
++    const val EXTERNAL_KEY_PIN1_FIELD = "externalKeyPin1Field"
++    const val EXTERNAL_KEY_CANCEL_ACTION = "externalKeyCancelAction"
++    const val EXTERNAL_KEY_AUTHENTICATE_ACTION = "externalKeyAuthenticateAction"
+     const val DIAGNOSTICS_BUTTON = "diagnosticsButton"
+     const val DIAGNOSTICS_SCREEN = "diagnosticsScreen"
+     const val COPY_REPORT_ACTION = "copyReportAction"
+diff --git b/app/src/main/java/fi/refineid/android/usb/UsbReaderController.kt a/app/src/main/java/fi/refineid/android/usb/UsbReaderController.kt
+index d0b3e35..2fde326 100644
+--- b/app/src/main/java/fi/refineid/android/usb/UsbReaderController.kt
++++ a/app/src/main/java/fi/refineid/android/usb/UsbReaderController.kt
+@@ -26,11 +26,13 @@ import fi.refineid.android.core.Pin1Submission
+ import fi.refineid.android.core.Pin1VerificationResult
+ import fi.refineid.android.core.readOnOwnerThread
+ import fi.refineid.android.diagnostics.AppTrace
++import fi.refineid.android.keychain.nextProviderGeneration
+ import fi.refineid.android.usb.ccid.CcidSessionOpenResult
+ import fi.refineid.android.usb.ccid.CcidUsbSession
+ import fi.refineid.android.usb.ccid.CcidUsbSessionOpener
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.withTimeoutOrNull
++import java.security.SecureRandom
+ import java.util.concurrent.CompletableFuture
+ import java.util.concurrent.ExecutorService
+ import java.util.concurrent.Executors
+@@ -106,6 +108,7 @@ internal class UsbReaderController(
+         )
+     private val mainHandler = Handler(Looper.getMainLooper())
+     private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor()
++    private val providerGenerationRandom = SecureRandom()
+     private val stateListeners = linkedSetOf<(UsbReaderSnapshot) -> Unit>()
+ 
+     @Volatile
+@@ -142,6 +145,19 @@ internal class UsbReaderController(
+ 
+     // Worker-thread confined. Main-thread state never owns a USB connection.
+     private var activeSession: CcidUsbSession? = null
++    private var activeProviderGeneration: Long? = null
++
++    internal val externalKeyCardSession =
++        UsbExternalKeyCardSession(
++            ioExecutor = ioExecutor,
++            isAvailable = {
++                isStarted &&
++                    latestSnapshot.status == ReaderConnectionStatus.READY &&
++                    latestSnapshot.cardPresence == CardPresence.PRESENT
++            },
++            activeSession = { activeSession },
++            activeProviderGeneration = { activeProviderGeneration },
++        )
+ 
+     internal val qualifiedCardService =
+         UsbQualifiedCardService(
+@@ -566,6 +582,9 @@ internal class UsbReaderController(
+                         NativeCertificateReadFailure.CARD_UNAVAILABLE,
+                     )
+                 }
++            if (result is NativeContactlessOpenResult.Success) {
++                activeProviderGeneration = providerGenerationRandom.nextProviderGeneration()
++            }
+             val certificate =
+                 when (result) {
+                     is NativeContactlessOpenResult.Success -> result.certificate
+@@ -777,6 +796,7 @@ internal class UsbReaderController(
+             var cardDetails: PersonCardDetails? = null
+             if (result is CcidSessionOpenResult.Ready) {
+                 activeSession = result.session
++                activeProviderGeneration = providerGenerationRandom.nextProviderGeneration()
+                 setupRemovalListener(result.session, device, generation)
+                 try {
+                     val cert = result.session.copyAuthenticationCertificate()
+@@ -791,10 +811,12 @@ internal class UsbReaderController(
+                 }
+             } else if (result is CcidSessionOpenResult.AccessNumberRequired) {
+                 // Hold the contactless session so a CAN entry can run PACE on it.
++                // No provider generation until connect() actually opens the card.
+                 activeSession = result.session
+                 setupRemovalListener(result.session, device, generation)
+             } else if (result is CcidSessionOpenResult.ActivationRequired) {
+                 activeSession = result.session
++                activeProviderGeneration = providerGenerationRandom.nextProviderGeneration()
+                 setupRemovalListener(result.session, device, generation)
+                 try {
+                     val cert = result.session.copyAuthenticationCertificate()
+@@ -964,6 +986,7 @@ internal class UsbReaderController(
+     }
+ 
+     private fun closeActiveSession() {
++        activeProviderGeneration = null
+         activeSession?.close()
+         activeSession = null
+     }
+diff --git b/app/src/main/res/values-fi/strings.xml a/app/src/main/res/values-fi/strings.xml
+index aab9de8..7878f0e 100644
+--- b/app/src/main/res/values-fi/strings.xml
++++ a/app/src/main/res/values-fi/strings.xml
+@@ -33,6 +33,7 @@
+     <string name="back">Takaisin</string>
+     <string name="browser">Selain</string>
+     <string name="timestamp_authorities">Aikaleimapalvelut</string>
++    <string name="authenticate">Tunnistaudu</string>
+     <string name="cancel">Peruuta</string>
+     <string name="signature">Allekirjoitus</string>
+     <string name="ok">Selvä</string>
+diff --git b/app/src/main/res/values-sv/strings.xml a/app/src/main/res/values-sv/strings.xml
+index 40d4e9a..477e1ea 100644
+--- b/app/src/main/res/values-sv/strings.xml
++++ a/app/src/main/res/values-sv/strings.xml
+@@ -33,6 +33,7 @@
+     <string name="back">Tillbaka</string>
+     <string name="browser">Webbläsare</string>
+     <string name="timestamp_authorities">Tidsstämpeltjänster</string>
++    <string name="authenticate">Identifiera dig</string>
+     <string name="cancel">Avbryt</string>
+     <string name="signature">Underskrift</string>
+     <string name="ok">OK</string>
+diff --git b/app/src/main/res/values/strings.xml a/app/src/main/res/values/strings.xml
+index d51486e..b367d9a 100644
+--- b/app/src/main/res/values/strings.xml
++++ a/app/src/main/res/values/strings.xml
+@@ -37,6 +37,7 @@
+     <string name="back">Back</string>
+     <string name="browser">Browser</string>
+     <string name="timestamp_authorities">Timestamp services</string>
++    <string name="authenticate">Authenticate</string>
+     <string name="cancel">Cancel</string>
+     <string name="signature">Signature</string>
+     <string name="ok">OK</string>
+diff --git b/app/src/release/java/fi/refineid/android/diagnostics/AppTrace.kt a/app/src/release/java/fi/refineid/android/diagnostics/AppTrace.kt
+index cb38fbd..ebc7c36 100644
+--- b/app/src/release/java/fi/refineid/android/diagnostics/AppTrace.kt
++++ a/app/src/release/java/fi/refineid/android/diagnostics/AppTrace.kt
+@@ -22,6 +22,8 @@ import fi.refineid.android.document.QualifiedPdfArchivalResult
+ import fi.refineid.android.document.QualifiedPdfArchivalStage
+ import fi.refineid.android.document.QualifiedPdfPreparationResult
+ import fi.refineid.android.document.QualifiedPdfSigningResult
++import fi.refineid.android.keychain.ExternalKeyPinAuthorization
++import fi.refineid.android.keychain.ExternalKeySignResult
+ import fi.refineid.android.network.SigningTimestampAttemptOutcome
+ import fi.refineid.android.nfc.NfcReaderStatus
+ import fi.refineid.android.rapp.RappBleGattEvent
+@@ -49,6 +51,24 @@ internal object AppTrace {
+ 
+     fun activityDestroyed() = Unit
+ 
++    fun externalKeyProviderServiceCreated() = Unit
++
++    fun externalKeyProviderServiceBound(isAccepted: Boolean) = Unit
++
++    fun externalKeyProviderServiceDestroyed() = Unit
++
++    fun externalKeyIdentityQueried(isAvailable: Boolean) = Unit
++
++    fun externalKeySignStarted(algorithm: AuthenticationSigningAlgorithm) = Unit
++
++    fun externalKeySignCompleted(result: ExternalKeySignResult) = Unit
++
++    fun externalKeyIdentityRemovalCompleted(isRemoved: Boolean) = Unit
++
++    fun externalKeyPinPromptDispatched() = Unit
++
++    fun externalKeyPinPromptCompleted(authorization: ExternalKeyPinAuthorization) = Unit
++
+     fun nativeLibraryLoadCompleted(isSuccessful: Boolean) = Unit
+ 
+     fun nativeAtrValidationCompleted(result: AtrValidation) = Unit
