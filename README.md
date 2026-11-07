@@ -1,5 +1,8 @@
 # refineid-hack
-POSIX shell utility for RefineID experiments.
+POSIX shell utilities for RefineID experiments. Everything here is a
+hack: written to try something out, kept because it was useful once, and
+not maintained to the standard of the RefineID applications. Read
+`SECURITY.md` before taking anything here seriously.
 
 `fetch_suomi_occupation.sh` implements a self-contained suomi.fi login chain over an
 SSHed host and fetches `value.profession` from the authenticated personal-data API.
