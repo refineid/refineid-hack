@@ -10,6 +10,9 @@ from refineid-android; its own README says what it is and what it needs.
 `konqueror-bridge/` is a local proxy that does TLS client authentication with a
 card for Konqueror on FreeBSD; see its README.
 
+`rapp-ble-probe/` is a FreeBSD probe of a phone's RAPP GATT server over
+Bluetooth LE, including the pairing offer read; see its README.
+
 `fetch_suomi_occupation.sh` implements a self-contained suomi.fi login chain over an
 SSHed host and fetches `value.profession` from the authenticated personal-data API.
 
