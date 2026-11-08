@@ -1,5 +1,17 @@
 # Repository instructions
 
+## What this repository is
+
+A scratchpad of hacks, not a product. Shortcuts the RefineID product
+repositories forbid are allowed here: do not file them as findings (a leak of a
+PIN or PUK is the exception, below), and do not rewrite code to product standard
+unless asked. One rule about secrets holds: nothing here may actively leak a PIN
+or PUK, by any route. That includes printing or logging one, sending it to
+another machine or service, writing it to a file or shell history, and
+committing it. A PIN or PUK may be handed only to the local program that talks
+to the card. How commits are made is not relaxed: the hooks in `githooks/`
+apply. See "Rules of this repository" in the README.
+
 ## Worktree policy
 
 - Reading does not require a worktree; writing does. The main checkout is
