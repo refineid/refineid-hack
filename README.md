@@ -15,18 +15,19 @@ SSHed host and fetches `value.profession` from the authenticated personal-data A
 
 ## Rules of this repository
 
-This is where the shortcuts go that the RefineID applications forbid: a PIN
-taken from the command line or the environment, TLS without certificate
+This is where the shortcuts go that the RefineID product repositories forbid: a
+PIN taken from the command line or the environment, TLS without certificate
 verification, and whatever else makes an experiment work on one machine on one
-afternoon. The rules of `refineid-core`,
-`refineid-unix`, `refineid-windows`, `refineid-android` and `refineid-apple`
-do not apply to the code here, and code that breaks one of them is not a
-defect for that reason alone.
+afternoon. The rules of those repositories (`refineid-core`, `refineid-unix`,
+`refineid-windows`, `refineid-android` and `refineid-apple`) do not apply to the
+code here, and code that breaks one of them is not a defect for that reason
+alone.
 
 One rule about secrets holds anyway: **nothing here may actively leak a PIN or
-PUK.** Code here must not print or log one, send it to another machine or
-service, write it to a file or to shell history, or commit one. The only thing
-it may hand a PIN or PUK to is the local program that talks to the card.
+PUK, by any route.** That includes printing or logging one, sending it to
+another machine or service, writing it to a file or to shell history, and
+committing it. The only thing code here may hand a PIN or PUK to is the local
+program that talks to the card.
 
 Taking a PIN or PUK from the command line or the environment is accepted, at
 its known cost: other processes on the same machine can read it while the

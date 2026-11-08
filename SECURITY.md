@@ -12,11 +12,13 @@ concrete scenario. There is no embargo and no private channel, because
 nothing in this repository guards anything: a finding here does not
 reach a RefineID user.
 
-Code here may do what the RefineID applications forbid. That is what this
-repository is for, so a report that it does so is not a finding. The exception
-is a PIN or PUK: code that prints or logs one, sends it to another machine or
-service, writes it to a file or shell history, or commits it is a finding here
-too. The README says so under "Rules of this repository".
+Code here may do what the RefineIDCode here may do what the RefineID product repositories forbid. That is what
+this repository is for, so a report that it does so is not a finding. A PIN or
+PUK is the exception: code that actively leaks one, by any route, is a finding
+here too. That includes printing or logging it, sending it to another machine or
+service, writing it to a file or shell history, committing it, and handing it to
+anything but the local program that talks to the card. The README says so under
+"Rules of this repository".
 
 What a report should not contain, here as anywhere: a real PIN, PUK or
 CAN, a private key, a full personal certificate, a personal identity
