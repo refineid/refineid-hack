@@ -3,11 +3,13 @@
 ## What this repository is
 
 A scratchpad of hacks, not a product. Shortcuts the RefineID applications
-forbid are allowed here: do not file them as findings, and do not rewrite a
-script to product standard unless asked. One rule holds: a script must never
-actively leak a PIN or PUK, which means no printing, logging, sending to
+forbid are allowed here: do not file them as findings, and do not rewrite code
+to product standard unless asked. One rule about secrets holds: nothing here
+may actively leak a PIN or PUK, which means no printing, logging, sending to
 another machine or service, writing to a file or shell history, or committing
-one. See "Rules of this repository" in the README.
+one. A PIN or PUK may be handed only to the local program that talks to the
+card. How commits are made is not relaxed: the hooks in `githooks/` apply. See
+"Rules of this repository" in the README.
 
 ## Worktree policy
 

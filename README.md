@@ -16,30 +16,32 @@ SSHed host and fetches `value.profession` from the authenticated personal-data A
 ## Rules of this repository
 
 This is where the shortcuts go that the RefineID applications forbid: a PIN
-taken from the command line or the environment, and whatever else makes an
-experiment work on one machine on one afternoon. The rules of `refineid-core`,
+taken from the command line or the environment, TLS without certificate
+verification, and whatever else makes an experiment work on one machine on one
+afternoon. The rules of `refineid-core`,
 `refineid-unix`, `refineid-windows`, `refineid-android` and `refineid-apple`
-do not apply to the scripts here, and a script that breaks one of them is not
-a defect for that reason alone.
+do not apply to the code here, and code that breaks one of them is not a
+defect for that reason alone.
 
-One rule holds anyway: **nothing here may actively leak a PIN or PUK.** A
-script must not print or log one, send it to another machine or service, write
-it to a file or to shell history, or commit one. The only thing it may hand a
-PIN or PUK to is the local program that talks to the card.
+One rule about secrets holds anyway: **nothing here may actively leak a PIN or
+PUK.** Code here must not print or log one, send it to another machine or
+service, write it to a file or to shell history, or commit one. The only thing
+it may hand a PIN or PUK to is the local program that talks to the card.
 
-Taking a PIN from the command line or the environment is accepted, at its known
-cost: other processes on the same machine can read it while the script runs.
+Taking a PIN or PUK from the command line or the environment is accepted, at
+its known cost: other processes on the same machine can read it while the
+program runs.
 
-The rules for how commits are made are not relaxed; the hooks in `githooks/`
-apply here as everywhere.
+How commits are made is not relaxed; the hooks in `githooks/` apply here as
+everywhere.
 
-### What it uses
+## What it uses
 
 - `openssl` for all HTTPS traffic and client TLS auth
 - POSIX utilities only for parsing (`awk`, `sed`, `grep`, `tr`, `cut`, `wc`, `mktemp`, `date`)
 - `lsusb` / `pcsc_scan` are optional for visibility only
 
-### PKCS#11 and certificates
+## PKCS#11 and certificates
 
 - Default mode is PEM-based client auth:
   - `OPENSSL_CLIENT_CERT` and `OPENSSL_CLIENT_KEY` must point to PEM files.
