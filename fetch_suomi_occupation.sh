@@ -108,12 +108,50 @@ TMPDIR="$(mktemp -d)"
 COOKIE_JAR="$TMPDIR/cookies.txt"
 trap 'rm -rf "$TMPDIR"' EXIT HUP INT TERM
 
+# Prints its arguments with the value of every pin-value attribute and every
+# occurrence of the PIN replaced, so that no message shows the PIN.
+redact() {
+  rest="$*"
+  out=""
+  while :; do
+    case "$rest" in
+      *pin-value=*)
+        out="${out}${rest%%pin-value=*}pin-value=<hidden>"
+        rest="${rest#*pin-value=}"
+        value="${rest%%[;&]*}"
+        rest="${rest#"$value"}"
+        ;;
+      *)
+        out="${out}${rest}"
+        break
+        ;;
+    esac
+  done
+  if [ -n "${PIN1:-}" ]; then
+    rest="$out"
+    out=""
+    while :; do
+      case "$rest" in
+        *"$PIN1"*)
+          out="${out}${rest%%"$PIN1"*}<hidden>"
+          rest="${rest#*"$PIN1"}"
+          ;;
+        *)
+          out="${out}${rest}"
+          break
+          ;;
+      esac
+    done
+  fi
+  printf '%s' "$out"
+}
+
 log() {
-  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(redact "$*")" >&2
 }
 
 fail() {
-  echo "error: $*" >&2
+  echo "error: $(redact "$*")" >&2
   exit 1
 }
 
@@ -326,11 +364,74 @@ resolve_usb_apdu_mode() {
   log "usb_ioctl_helper completed with exit status 0"
 }
 
+# sudo logs the command line it runs, so a PIN in the arguments would be
+# written to its log. The arguments go to sudo with the PIN replaced by
+# @PIN@, and the PIN follows on stdin, one line ahead of the input openssl
+# reads; the shell sudo starts reads that line, puts the PIN back into the
+# arguments and runs openssl. The caller gives this an input that ends:
+# a file, or /dev/null.
+run_openssl_as_root() {
+  if [ -z "${PIN1:-}" ]; then
+    sudo -n env OPENSSL_MODULES="$OPENSSL_PKCS11_MODULES" PKCS11_MODULE_PATH="${OPENSSL_PKCS11_MODULE_PATH-}" \
+      "$USAGE_OPENSSL" "$@"
+    return $?
+  fi
+
+  mask_count=$#
+  while [ "$mask_count" -gt 0 ]; do
+    mask_rest="$1"
+    shift
+    mask_out=""
+    while :; do
+      case "$mask_rest" in
+        *"$PIN1"*)
+          mask_out="${mask_out}${mask_rest%%"$PIN1"*}@PIN@"
+          mask_rest="${mask_rest#*"$PIN1"}"
+          ;;
+        *)
+          mask_out="${mask_out}${mask_rest}"
+          break
+          ;;
+      esac
+    done
+    set -- "$@" "$mask_out"
+    mask_count=$((mask_count - 1))
+  done
+
+  # shellcheck disable=SC2016
+  as_root='IFS= read -r pin
+prog=$1
+shift
+count=$#
+while [ "$count" -gt 0 ]; do
+  rest=$1
+  shift
+  restored=""
+  while :; do
+    case "$rest" in
+      *@PIN@*)
+        restored="${restored}${rest%%@PIN@*}${pin}"
+        rest="${rest#*@PIN@}"
+        ;;
+      *)
+        restored="${restored}${rest}"
+        break
+        ;;
+    esac
+  done
+  set -- "$@" "$restored"
+  count=$((count - 1))
+done
+exec "$prog" "$@"'
+
+  { printf '%s\n' "$PIN1"; cat; } | sudo -n env OPENSSL_MODULES="$OPENSSL_PKCS11_MODULES" \
+    PKCS11_MODULE_PATH="${OPENSSL_PKCS11_MODULE_PATH-}" sh -c "$as_root" sh "$USAGE_OPENSSL" "$@"
+}
+
 run_openssl() {
   if [ "${OPENSSL_PKCS11_USE_SUDO:-0}" = "1" ]; then
     if command -v sudo >/dev/null 2>&1; then
-      sudo -n env OPENSSL_MODULES="$OPENSSL_PKCS11_MODULES" PKCS11_MODULE_PATH="${OPENSSL_PKCS11_MODULE_PATH-}" \
-        "$USAGE_OPENSSL" "$@"
+      run_openssl_as_root "$@"
       return $?
     fi
   fi
@@ -388,7 +489,7 @@ resolve_pkcs11_provider_backend() {
 probe_open_ssl_pkcs11_uri() {
   cmd_op="$1"
   shift
-  if run_openssl "$cmd_op" -provider-path "$OPENSSL_PKCS11_MODULES" -provider default -provider pkcs11 "$@"; then
+  if run_openssl "$cmd_op" -provider-path "$OPENSSL_PKCS11_MODULES" -provider default -provider pkcs11 "$@" </dev/null; then
     return 0
   fi
 
@@ -399,7 +500,7 @@ probe_open_ssl_pkcs11_uri() {
   if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
     OPENSSL_PKCS11_USE_SUDO=1
     export OPENSSL_PKCS11_USE_SUDO
-    if run_openssl "$cmd_op" -provider-path "$OPENSSL_PKCS11_MODULES" -provider default -provider pkcs11 "$@"; then
+    if run_openssl "$cmd_op" -provider-path "$OPENSSL_PKCS11_MODULES" -provider default -provider pkcs11 "$@" </dev/null; then
       return 0
     fi
   fi
@@ -529,20 +630,25 @@ resolve_pkcs11_uris_auto() {
     return 1
   fi
 
-  cmd="pkcs11-tool --module $pkcs11_module --list-objects"
-  if [ -n "$PIN1" ]; then
-    cmd="$cmd --login --pin $PIN1"
-  fi
-
+  # sudo logs the command line it runs, so the PIN reaches pkcs11-tool on
+  # stdin and is put on its command line by the shell sudo starts.
+  run_as_root=""
   if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
-      cmd="sudo -n ${cmd}"
+      run_as_root="sudo -n"
     else
       return 1
     fi
   fi
 
-  if ! objs="$(sh -c "$cmd" 2>/dev/null)"; then
+  if [ -n "$PIN1" ]; then
+    # shellcheck disable=SC2016
+    if ! objs="$(printf '%s\n' "$PIN1" | $run_as_root sh -c \
+      'IFS= read -r pin; exec pkcs11-tool --module "$1" --list-objects --login --pin "$pin"' \
+      sh "$pkcs11_module" 2>/dev/null)"; then
+      return 1
+    fi
+  elif ! objs="$($run_as_root pkcs11-tool --module "$pkcs11_module" --list-objects 2>/dev/null)"; then
     return 1
   fi
 
