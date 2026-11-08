@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ATT opcodes and error codes (Bluetooth Core v5.4 Vol 3 Part F 3.4). */
@@ -56,6 +57,14 @@
 #define ATT_INDICATE 0x1d
 #define ATT_CONFIRM 0x1e
 #define ATT_COMMAND_FLAG 0x40
+/* Every ATT response opcode is odd (3.4); requests are even. */
+#define ATT_RESPONSE_BIT 0x01
+#define ATT_MTU_PDU_LEN 3
+#define ATT_FIND_INFO_REQ_LEN 5
+#define ATT_TYPED_DISCOVERY_REQ_MIN 7
+#define ATT_LIST_RSP_MIN 2
+#define GROUP_ENTRY_UUID16 (4 + 2)
+#define DECL_ENTRY_UUID16 (5 + 2)
 #define ATT_ERR_INVALID_HANDLE 0x01
 #define ATT_ERR_INVALID_PDU 0x04
 #define ATT_ERR_NOT_SUPPORTED 0x06
@@ -122,13 +131,15 @@ static void answer_peer(uint8_t op, ssize_t n)
 		printf("  phone indication, %zd bytes, confirmed\n", n);
 		return;
 	}
-	if (op == ATT_NOTIFY || (op & ATT_COMMAND_FLAG)) {
+	/* Only a request is answered with an Error Response (3.4.1.1). */
+	if (op == ATT_NOTIFY || op == ATT_CONFIRM || (op & ATT_COMMAND_FLAG) ||
+	    (op & ATT_RESPONSE_BIT)) {
 		printf("  phone PDU 0x%02x ignored\n", op);
 		return;
 	}
 	if (op == ATT_MTU_REQ) {
-		if (n == 3) {
-			uint8_t r[3] = { ATT_MTU_RSP };
+		if (n == ATT_MTU_PDU_LEN) {
+			uint8_t r[ATT_MTU_PDU_LEN] = { ATT_MTU_RSP };
 			put16(r + 1, REQUESTED_MTU);
 			tx(r, sizeof r);
 			printf("  phone MTU exchange answered\n");
@@ -137,7 +148,8 @@ static void answer_peer(uint8_t op, ssize_t n)
 		e[4] = ATT_ERR_INVALID_PDU;
 	} else if (op == ATT_FIND_INFO_REQ || op == ATT_FIND_BY_TYPE_VALUE_REQ ||
 	    op == ATT_READ_BY_TYPE_REQ || op == ATT_READ_BY_GROUP_REQ) {
-		if (n < ATT_ERROR_RSP_LEN) {
+		ssize_t min = op == ATT_FIND_INFO_REQ ? ATT_FIND_INFO_REQ_LEN : ATT_TYPED_DISCOVERY_REQ_MIN;
+		if (n < min) {
 			e[4] = ATT_ERR_INVALID_PDU;
 		} else {
 			uint16_t start = get16(buf + 1), end = get16(buf + 3);
@@ -149,21 +161,40 @@ static void answer_peer(uint8_t op, ssize_t n)
 	printf("  phone request 0x%02x refused (0x%02x)\n", op, e[4]);
 }
 
-/* Receives the response to our request: `want` or an Error Response. */
-static ssize_t rx_rsp(uint8_t want)
+static long long now_ms(void)
 {
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/*
+ * Receives the response to the request with opcode `request`: `want`
+ * of at least `min` octets, or an Error Response naming `request`.
+ * The 30 s transaction timer runs from the call (3.3.3).
+ */
+static ssize_t rx_rsp(uint8_t request, uint8_t want, ssize_t min)
+{
+	long long deadline = now_ms() + ATT_TRANSACTION_TIMEOUT_MS;
+
 	for (;;) {
+		long long left = deadline - now_ms();
 		struct pollfd pf = { s, POLLIN, 0 };
-		if (poll(&pf, 1, ATT_TRANSACTION_TIMEOUT_MS) <= 0) {
+		if (left <= 0 || poll(&pf, 1, (int)left) <= 0) {
 			fprintf(stderr, "timeout waiting for 0x%02x\n", want);
 			exit(1);
 		}
 		ssize_t n = recv(s, buf, sizeof buf, 0);
 		if (n <= 0) { fprintf(stderr, "recv: %zd %s\n", n, strerror(errno)); exit(1); }
-		if (buf[0] == want) return n;
+		if (buf[0] == want) {
+			if (n < min) { fprintf(stderr, "short PDU 0x%02x\n", want); exit(1); }
+			return n;
+		}
 		if (buf[0] == ATT_ERROR_RSP) {
 			if (n < ATT_ERROR_RSP_LEN) { fprintf(stderr, "short Error Response\n"); exit(1); }
-			return n;
+			if (buf[1] == request) return n;
+			printf("  Error Response for another request ignored\n");
+			continue;
 		}
 		answer_peer(buf[0], n);
 	}
@@ -181,7 +212,7 @@ static void read_bootstrap(uint16_t boot, const char *when)
 	uint8_t q[3] = { ATT_READ_REQ };
 	put16(q + 1, boot);
 	tx(q, sizeof q);
-	ssize_t n = rx_rsp(ATT_READ_RSP);
+	ssize_t n = rx_rsp(ATT_READ_REQ, ATT_READ_RSP, 1);
 	char what[64];
 	snprintf(what, sizeof what, "bootstrap read %s", when);
 	if (refused(what)) return;
@@ -211,7 +242,7 @@ static void write_pairing_preamble(uint16_t chan)
 	w[m++] = SAR_SINGLE; w[m++] = 0;
 	memcpy(w + m, pre, k); m += k;
 	tx(w, m);
-	rx_rsp(ATT_WRITE_RSP);
+	rx_rsp(ATT_WRITE_REQ, ATT_WRITE_RSP, 1);
 	if (refused("pairing preamble")) exit(1);
 	printf("pairing preamble (%zu bytes, SAR SINGLE): accepted\n", k);
 }
@@ -244,8 +275,8 @@ int main(int argc, char **argv)
 	if (connect(s, (struct sockaddr *)&sa, sizeof sa) < 0) { perror("connect"); return 1; }
 	printf("connected (ATT fixed channel)\n");
 
-	q[0] = ATT_MTU_REQ; put16(q + 1, REQUESTED_MTU); tx(q, 3);
-	n = rx_rsp(ATT_MTU_RSP);
+	q[0] = ATT_MTU_REQ; put16(q + 1, REQUESTED_MTU); tx(q, ATT_MTU_PDU_LEN);
+	rx_rsp(ATT_MTU_REQ, ATT_MTU_RSP, ATT_MTU_PDU_LEN);
 	if (refused("MTU exchange")) return 1;
 	uint16_t server = get16(buf + 1);
 	uint16_t mtu = server < REQUESTED_MTU ? server : REQUESTED_MTU;
@@ -256,11 +287,12 @@ int main(int argc, char **argv)
 	for (;;) {
 		q[0] = ATT_READ_BY_GROUP_REQ; put16(q + 1, start); put16(q + 3, LAST_HANDLE);
 		put16(q + 5, UUID_PRIMARY); tx(q, 7);
-		n = rx_rsp(ATT_READ_BY_GROUP_RSP);
+		n = rx_rsp(ATT_READ_BY_GROUP_REQ, ATT_READ_BY_GROUP_RSP, ATT_LIST_RSP_MIN);
 		if (buf[0] == ATT_ERROR_RSP) break;
 		uint8_t len = buf[1];
+		if (len != GROUP_ENTRY_UUID16 && len != 4 + UUID128_LEN) break;
 		uint16_t last = 0;
-		for (ssize_t i = 2; len && i + len <= n; i += len) {
+		for (ssize_t i = ATT_LIST_RSP_MIN; i + len <= n; i += len) {
 			uint16_t h = get16(buf + i), e = get16(buf + i + 2);
 			if (len == 4 + UUID128_LEN && is_rapp(buf + i + 4, RAPP_SERVICE)) {
 				svc_start = h; svc_end = e;
@@ -270,7 +302,7 @@ int main(int argc, char **argv)
 			}
 			last = e;
 		}
-		if (last == 0 || last == LAST_HANDLE) break;
+		if (last < start || last == LAST_HANDLE) break;
 		start = last + 1;
 	}
 	if (!svc_start) { printf("RAPP service not found\n"); return 1; }
@@ -281,18 +313,19 @@ int main(int argc, char **argv)
 	while (start <= svc_end) {
 		q[0] = ATT_READ_BY_TYPE_REQ; put16(q + 1, start); put16(q + 3, svc_end);
 		put16(q + 5, UUID_CHARACTERISTIC); tx(q, 7);
-		n = rx_rsp(ATT_READ_BY_TYPE_RSP);
+		n = rx_rsp(ATT_READ_BY_TYPE_REQ, ATT_READ_BY_TYPE_RSP, ATT_LIST_RSP_MIN);
 		if (buf[0] == ATT_ERROR_RSP) break;
 		uint8_t len = buf[1];
+		if (len != DECL_ENTRY_UUID16 && len != 5 + UUID128_LEN) break;
 		uint16_t last = 0;
-		for (ssize_t i = 2; len && i + len <= n; i += len) {
+		for (ssize_t i = ATT_LIST_RSP_MIN; i + len <= n; i += len) {
 			uint16_t decl = get16(buf + i), vh = get16(buf + i + 3);
 			uint8_t props = buf[i + 2];
 			if (len == 5 + UUID128_LEN && is_rapp(buf + i + 5, RAPP_CHANNEL)) { chan = vh; chan_props = props; }
 			if (len == 5 + UUID128_LEN && is_rapp(buf + i + 5, RAPP_BOOTSTRAP)) { boot = vh; boot_props = props; }
 			last = decl;
 		}
-		if (last == 0 || last == LAST_HANDLE) break;
+		if (last < start || last == LAST_HANDLE) break;
 		start = last + 1;
 	}
 	printf("channel: value 0x%04x properties 0x%02x (needs Write and Indicate): %s\n",
@@ -302,10 +335,12 @@ int main(int argc, char **argv)
 	    boot, boot_props, boot && (boot_props & PROP_READ) ? "ok" : "MISMATCH");
 	if (!chan || !boot) return 1;
 
-	q[0] = ATT_FIND_INFO_REQ; put16(q + 1, chan + 1); put16(q + 3, svc_end); tx(q, 5);
-	n = rx_rsp(ATT_FIND_INFO_RSP);
+	if (chan >= svc_end) { printf("channel CCCD: NOT FOUND (no handle after the value)\n"); return 1; }
+	q[0] = ATT_FIND_INFO_REQ; put16(q + 1, chan + 1); put16(q + 3, svc_end);
+	tx(q, ATT_FIND_INFO_REQ_LEN);
+	n = rx_rsp(ATT_FIND_INFO_REQ, ATT_FIND_INFO_RSP, ATT_LIST_RSP_MIN);
 	if (buf[0] == ATT_FIND_INFO_RSP && buf[1] == 1)
-		for (ssize_t i = 2; i + 4 <= n; i += 4)
+		for (ssize_t i = ATT_LIST_RSP_MIN; i + 4 <= n; i += 4)
 			if (get16(buf + i + 2) == UUID_CCCD && !cccd) cccd = get16(buf + i);
 	printf("channel CCCD: 0x%04x %s\n", cccd, cccd ? "ok" : "NOT FOUND");
 	if (!cccd) return 1;
@@ -313,7 +348,7 @@ int main(int argc, char **argv)
 	read_bootstrap(boot, "without routing");
 
 	q[0] = ATT_WRITE_REQ; put16(q + 1, cccd); put16(q + 3, CCCD_INDICATIONS); tx(q, 5);
-	rx_rsp(ATT_WRITE_RSP);
+	rx_rsp(ATT_WRITE_REQ, ATT_WRITE_RSP, 1);
 	if (refused("CCCD write")) return 1;
 	printf("CCCD write 0x%04x: ok\n", CCCD_INDICATIONS);
 
