@@ -12,6 +12,11 @@ concrete scenario. There is no embargo and no private channel, because
 nothing in this repository guards anything: a finding here does not
 reach a RefineID user.
 
+A script here may do what the RefineID applications forbid. That is what
+this repository is for, so a report that a script does so is not a finding.
+The exception is a PIN or PUK: a script that prints, logs, sends or stores one
+is a defect here too. The README says so under "Rules of this repository".
+
 What a report should not contain, here as anywhere: a real PIN, PUK or
 CAN, a private key, a full personal certificate, a personal identity
 code, or an unredacted log. Those identify a real person and cannot be

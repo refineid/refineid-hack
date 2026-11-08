@@ -1,5 +1,14 @@
 # Repository instructions
 
+## What this repository is
+
+A scratchpad of hacks, not a product. Shortcuts the RefineID applications
+forbid are allowed here: do not file them as findings, and do not rewrite a
+script to product standard unless asked. One rule holds: a script must never
+actively leak a PIN or PUK, which means no printing, logging, sending to
+another machine or service, writing to a file or shell history, or committing
+one. See "Rules of this repository" in the README.
+
 ## Worktree policy
 
 - Reading does not require a worktree; writing does. The main checkout is
