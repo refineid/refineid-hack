@@ -24,8 +24,9 @@ apply. See "Rules of this repository" in the README.
 - Never put a git worktree under `/tmp`. It is cleared on reboot and takes the
   branch's only checkout with it.
 - One task, one worktree, one branch (`<topic>`), one pull request per branch.
-- Merge the pull request after mandatory local verification and review pass,
-  then remove the worktree and branch and fast-forward `main`.
+- Merge the pull request once local verification passes, and the review
+  too when one ran; then remove the worktree and branch and fast-forward
+  `main`.
 
 ## Source comments
 
@@ -82,11 +83,15 @@ apply. See "Rules of this repository" in the README.
 
 ## Independent review
 
-- Before a pull request merges, review its diff independently with the `agy`
-  CLI and Gemini models: `gemini-3.8-flash-high` always, plus
-  `gemini-3.1-pro-high` for protocol, cryptography or state-machine changes.
-- Run `agy` headless in its sandbox and plan mode, from an empty directory,
-  with the diff pasted into the prompt and no tool use. Frame the request as
-  a code review from the project's author.
+- Review is optional here: the agent decides whether a change needs one, for
+  example code that parses what a card, a network or a radio sends.
+- A review uses a model from a different family than the one that wrote the
+  change: the `agy` CLI with `gemini-3.8-flash-high`, or a free OpenCode model
+  (`opencode models | grep ^opencode`; deepseek and glm are usually good, and
+  another one can be too).
+- Run it headless and read-only from an empty directory, with the diff in the
+  prompt and no tool use, framed as a code review from the project's author:
+  `agy --sandbox --mode plan --model gemini-3.8-flash-high -p "$prompt"` or
+  `opencode run --archived --agent plan -m opencode/<model> "$prompt"`.
 - Check every finding against the code. Fix the real ones and list the
   rejected ones, with the reason, in the pull request description.
