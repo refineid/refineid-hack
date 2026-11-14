@@ -5,14 +5,20 @@
 // keychain-access-groups entitlement either: AMFI SIGKILLs it at launch
 // (Unsatisfied Entitlements). What works is packaging the tool as an .app:
 //
-//   swiftc -O -o dplist.app/Contents/MacOS/dplist dplist.swift -framework Security
-//   codesign -s "$CODESIGN_IDENTITY" \
-//     --entitlements dplist.entitlements -f dplist.app
-//   ./dplist.app/Contents/MacOS/dplist [group ...]
+// Set CODESIGN_IDENTITY to a local Apple Development certificate and substitute
+// an access group belonging to that certificate's team into a local copy of
+// dplist.entitlements before signing:
 //
-// With no group arguments, lists the ungrouped store; pass any access groups
-// declared in dplist.entitlements on the command line. Secrets are never
-// fetched: attributes enumerate silently, secret bytes would prompt per item.
+//   mkdir -p dplist.app/Contents/MacOS
+//   swiftc -O -o dplist.app/Contents/MacOS/dplist dplist.swift -framework Security
+//   sed "s|TEAMID.example.group|$ACCESS_GROUP|" dplist.entitlements > dplist.local.entitlements
+//   codesign -s "$CODESIGN_IDENTITY" \
+//     --entitlements dplist.local.entitlements -f dplist.app
+//   ./dplist.app/Contents/MacOS/dplist "$ACCESS_GROUP"
+//
+// With no group arguments, lists the ungrouped store; pass each entitled
+// access group on the command line. Secrets are never fetched: attributes
+// enumerate silently, secret bytes would prompt per item.
 import Foundation
 import Security
 
