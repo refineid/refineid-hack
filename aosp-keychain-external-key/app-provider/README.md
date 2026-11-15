@@ -54,9 +54,7 @@ refineid-android checkout with `cp -R app-provider/app <checkout>/`:
 `RefineIdApplication.onCreate` built one `TransportSelectingCardSession` over
 `readerController.externalKeyCardSession` and
 `nfcReaderController.externalKeyCardSession`, then an
-`ExternalKeyPinPromptBroker` (with `AndroidExternalKeyCallerLabelResolver`,
-the app's `AuthenticationPinCache`, and a `cardFor` lambda mapping a provider
-generation to the `AuthenticationCardIdentity` of that card's certificate),
+`ExternalKeyPinPromptBroker` (with `AndroidExternalKeyCallerLabelResolver`),
 and an `ExternalKeyProviderRuntime` over the session, the broker and the
 app's `CaCertificateStore` as issuer source. Both were `internal lateinit`
 properties (`pinPromptBroker`, `externalKeyProviderRuntime`), and

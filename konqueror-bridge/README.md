@@ -29,8 +29,10 @@ side of that TLS connection for Konqueror.
 ## What it does
 
 - It listens on `127.0.0.1:18443` and answers only a client that presents the
-  secret from the user's bridge directory, so other local users cannot reach
-  the card through it.
+  per-start secret from the user's bridge directory. The secret is regenerated
+  each time the proxy starts. If another local process is listening on the port
+  when the patched Konqueror part connects, the browser sends that secret to it;
+  starting the proxy after such a capture invalidates the captured secret.
 - CONNECT to port 443 of `card.refineid.fi`, `suomi.fi`, `fineid.fi`, `dvv.fi`,
   `vrk.fi` or a subdomain of one of them is terminated. The match is on whole
   name labels. All other traffic is relayed untouched.
@@ -40,19 +42,21 @@ side of that TLS connection for Konqueror.
   client certificate. A cancelled PIN dialog never reaches the card.
 
 Nothing is added to system trust. On first start the proxy creates a private
-key, a self-signed certificate and the secret in
-`$XDG_DATA_HOME/refineid/bridge` (`~/.local/share/refineid/bridge`), readable
-only by the user. The patched Konqueror part trusts that one public key through
-Chromium's `--ignore-certificate-errors-spki-list`, and only in Konqueror.
+key and a self-signed certificate in `$XDG_DATA_HOME/refineid/bridge`
+(`~/.local/share/refineid/bridge`), readable only by the user. The proxy
+secret in that directory is replaced on every start. The patched Konqueror part
+trusts that one public key through Chromium's
+`--ignore-certificate-errors-spki-list`, and only in Konqueror.
 
 Anything that runs as the user can read those files and use the proxy. It still
-cannot get PIN 1 or the card's key out of it.
+cannot get PIN 1 or the card's key out of it. If an attacker-controlled process
+listens on `127.0.0.1:18443` before the proxy binds, the patched browser may
+send the proxy secret to it; restart the proxy to rotate the secret. The
+loopback proxy is a local man-in-the-middle for the listed domains by design.
 
 ## Known limits
 
 - Plain `http://` pages fail: the proxy answers only CONNECT.
-- The patch trusts whatever listens on the port. Another local user who binds it
-  first receives the proxy secret.
 - A reader token whose key fails to load does not fall back to the phone token.
 - The first certificate and first key of a token are paired without a check.
 - A missing `cert.pem` beside an existing `key.pem` stops the proxy until the

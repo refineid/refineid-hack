@@ -15,9 +15,9 @@ print_usage() {
   echo "Options:"
   echo "  --pr <NUM>          Review a GitHub pull request by number"
   echo "  --repo <OWNER/REPO> GitHub repository (default: auto-detected from git remote)"
-  echo "  --submit            Submit the review to the GitHub PR (comment/approve)"
-  echo "  --approve           When submitting to PR, submit as APPROVE"
-  echo "  --request-changes   When submitting to PR, submit as REQUEST_CHANGES"
+  echo ""
+  echo "Safety: PR metadata and diffs are untrusted input. This script never posts"
+  echo "reviews to GitHub. Use --allow-untrusted-pr-content to review a PR."
   echo "  -o, --output <FILE> Write review markdown output to file"
   echo "  -h, --help          Show this help message"
   echo ""
@@ -25,15 +25,13 @@ print_usage() {
   echo "  $PROGNAME                         # Review uncommitted working tree changes"
   echo "  $PROGNAME HEAD~1..HEAD            # Review the most recent commit"
   echo "  $PROGNAME main...feature-branch   # Review a branch diff against main"
-  echo "  $PROGNAME --pr 65                 # Review GitHub PR #65"
-  echo "  $PROGNAME --pr 65 --submit        # Review PR #65 and post review to GitHub"
+  echo "  $PROGNAME --pr 65 --allow-untrusted-pr-content  # Review GitHub PR #65 (untrusted input)"
   exit 1
 }
 
 PR_NUM=""
 REPO=""
-SUBMIT=""
-REVIEW_EVENT="COMMENT"
+ALLOW_UNTRUSTED_PR=""
 OUTPUT_FILE=""
 GIT_RANGE=""
 
@@ -47,18 +45,8 @@ while [[ $# -gt 0 ]]; do
       REPO="$2"
       shift 2
       ;;
-    --submit)
-      SUBMIT="1"
-      shift
-      ;;
-    --approve)
-      SUBMIT="1"
-      REVIEW_EVENT="APPROVE"
-      shift
-      ;;
-    --request-changes)
-      SUBMIT="1"
-      REVIEW_EVENT="REQUEST_CHANGES"
+    --allow-untrusted-pr-content)
+      ALLOW_UNTRUSTED_PR="1"
       shift
       ;;
     -o|--output)
@@ -97,12 +85,16 @@ PROMPT_FILE="$TMP_DIR/prompt.md"
 REVIEW_FILE="$TMP_DIR/review.md"
 
 if [[ -n "$PR_NUM" ]]; then
+  if [[ "$ALLOW_UNTRUSTED_PR" != "1" ]]; then
+    echo "Error: PR content is untrusted. Re-run with --allow-untrusted-pr-content if you understand the risk." >&2
+    exit 1
+  fi
   REPO_FLAG=()
   if [[ -n "$REPO" ]]; then
     REPO_FLAG=(--repo "$REPO")
   fi
 
-  echo "==> Fetching PR #$PR_NUM details and diff..." >&2
+  echo "==> Fetching PR #$PR_NUM details and diff (untrusted input)..." >&2
   gh pr view "$PR_NUM" "${REPO_FLAG[@]}" > "$CONTEXT_FILE" 2>&1 || {
     echo "Error: failed to fetch PR #$PR_NUM metadata with gh" >&2
     exit 1
@@ -194,9 +186,9 @@ PROMPT_EOF
   cat "$DIFF_FILE"
 } >> "$PROMPT_FILE"
 
-echo "==> Invoking Antigravity reviewer ($AGY_BIN --dangerously-skip-permissions --print)..." >&2
+echo "==> Invoking Antigravity reviewer ($AGY_BIN --print)..." >&2
 
-"$AGY_BIN" --dangerously-skip-permissions --print "$(cat "$PROMPT_FILE")" > "$REVIEW_FILE" 2>&1 || {
+"$AGY_BIN" --print "$(cat "$PROMPT_FILE")" > "$REVIEW_FILE" 2>&1 || {
   echo "Error: agy --print failed" >&2
   cat "$REVIEW_FILE" >&2
   exit 1
@@ -208,25 +200,3 @@ if [[ -n "$OUTPUT_FILE" ]]; then
 fi
 
 cat "$REVIEW_FILE"
-
-if [[ "$SUBMIT" == "1" && -n "$PR_NUM" ]]; then
-  echo "" >&2
-  echo "==> Submitting review to GitHub PR #$PR_NUM ($REVIEW_EVENT)..." >&2
-  REPO_FLAG=()
-  if [[ -n "$REPO" ]]; then
-    REPO_FLAG=(--repo "$REPO")
-  fi
-
-  case "$REVIEW_EVENT" in
-    APPROVE)
-      gh pr review "$PR_NUM" "${REPO_FLAG[@]}" --approve --body-file "$REVIEW_FILE"
-      ;;
-    REQUEST_CHANGES)
-      gh pr review "$PR_NUM" "${REPO_FLAG[@]}" --request-changes --body-file "$REVIEW_FILE"
-      ;;
-    *)
-      gh pr review "$PR_NUM" "${REPO_FLAG[@]}" --comment --body-file "$REVIEW_FILE"
-      ;;
-  esac
-  echo "==> Review successfully posted to GitHub PR #$PR_NUM!" >&2
-fi

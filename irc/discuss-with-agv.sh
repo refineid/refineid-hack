@@ -30,10 +30,11 @@ print_usage() {
   echo "  transcript --pr <NUM> [--repo <OWNER/REPO>]"
   echo "      Display the complete multi-turn discussion transcript."
   echo ""
-  echo "  submit --pr <NUM> [--repo <OWNER/REPO>] [--approve | --comment]"
-  echo "      Submit the discussion transcript to the GitHub PR."
+  echo "  submit --pr <NUM> [--repo <OWNER/REPO>]"
+  echo "      Write a local note that submission is disabled for safety."
   echo ""
-  echo "Examples:"
+  echo "Safety: PR metadata and diffs are untrusted input. This script never runs"
+  echo "agents with permission checks disabled and never posts reviews to GitHub."
   echo "  $PROGNAME start --pr 65 --repo refineid/refineid-mono-internal"
   echo "  $PROGNAME reply --pr 65 \"Fixed the clone/cd mismatch in site/beta/index.html.\""
   echo "  $PROGNAME transcript --pr 65"
@@ -52,7 +53,6 @@ REPO=""
 INTENT=""
 MESSAGE=""
 MSG_FILE=""
-SUBMIT_EVENT="COMMENT"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -71,14 +71,6 @@ while [[ $# -gt 0 ]]; do
     --file)
       MSG_FILE="$2"
       shift 2
-      ;;
-    --approve)
-      SUBMIT_EVENT="APPROVE"
-      shift
-      ;;
-    --comment)
-      SUBMIT_EVENT="COMMENT"
-      shift
       ;;
     -h|--help)
       print_usage
@@ -172,7 +164,7 @@ EOF
     } >> "$TMP_DIR/prompt.md"
 
     echo "==> Sending initial review request to Antigravity..." >&2
-    "$AGY_BIN" --dangerously-skip-permissions --print "$(cat "$TMP_DIR/prompt.md")" > "$TMP_DIR/agv_reply.txt" 2>&1 || {
+    "$AGY_BIN" --print "$(cat "$TMP_DIR/prompt.md")" > "$TMP_DIR/agv_reply.txt" 2>&1 || {
       echo "Error: agy --print failed" >&2
       cat "$TMP_DIR/agv_reply.txt" >&2
       exit 1
@@ -200,8 +192,6 @@ ${INTENT:-"Submitted PR #$PR_NUM and diff for rigorous review against RefineID p
 $(cat "$TMP_DIR/agv_reply.txt")
 
 EOF
-
-    notify_irc ag "#refineid" "$(cat "$TMP_DIR/agv_reply.txt")"
 
     cat "$TMP_DIR/agv_reply.txt"
     echo ""
@@ -231,8 +221,6 @@ EOF
     TMP_DIR=$(mktemp -d -t discuss-agv-reply-XXXXXX)
     trap 'rm -rf "$TMP_DIR"' EXIT
 
-    notify_irc muse "#refineid" "[Turn $NEXT_TURN to Antigravity]: $CONTENT"
-
     echo "==> Sending Turn $NEXT_TURN to Antigravity..." >&2
     cat << EOF > "$TMP_DIR/reply_prompt.md"
 Below is the ongoing review discussion transcript for $REPO PR #$PR_NUM:
@@ -247,7 +235,7 @@ Please review this response / updated status in the context of the full review h
 Provide your assessment, any remaining observations, or your updated review status.
 EOF
 
-    "$AGY_BIN" --dangerously-skip-permissions --print "$(cat "$TMP_DIR/reply_prompt.md")" > "$TMP_DIR/agv_reply.txt" 2>&1 || {
+    "$AGY_BIN" --print "$(cat "$TMP_DIR/reply_prompt.md")" > "$TMP_DIR/agv_reply.txt" 2>&1 || {
       echo "Error: agy --print failed" >&2
       cat "$TMP_DIR/agv_reply.txt" >&2
       exit 1
@@ -265,8 +253,6 @@ $CONTENT
 $(cat "$TMP_DIR/agv_reply.txt")
 
 EOF
-
-    notify_irc ag "#refineid" "[Turn $NEXT_TURN from Antigravity]: $(cat "$TMP_DIR/agv_reply.txt")"
 
     cat "$TMP_DIR/agv_reply.txt"
     ;;
@@ -286,17 +272,8 @@ EOF
       exit 1
     fi
 
-    echo "==> Posting discussion transcript to GitHub PR #$PR_NUM ($SUBMIT_EVENT)..." >&2
-    case "$SUBMIT_EVENT" in
-      APPROVE)
-        gh pr review "$PR_NUM" --repo "$REPO" --approve --body-file "$TRANSCRIPT_FILE"
-        ;;
-      *)
-        gh pr review "$PR_NUM" --repo "$REPO" --comment --body-file "$TRANSCRIPT_FILE"
-        ;;
-    esac
-    notify_irc muse "#refineid" "Discussion transcript posted to GitHub PR #$PR_NUM ($SUBMIT_EVENT)."
-    echo "==> Transcript posted successfully to GitHub PR #$PR_NUM!" >&2
+    echo "Error: posting reviews to GitHub is disabled for safety. Transcript is at: $TRANSCRIPT_FILE" >&2
+    exit 1
     ;;
 
   *)

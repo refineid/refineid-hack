@@ -174,12 +174,6 @@ index 6d301a8..5e95797 100644
 +            ExternalKeyPinPromptBroker(
 +                context = this,
 +                callerLabelResolver = AndroidExternalKeyCallerLabelResolver(packageManager),
-+                pinCache = authenticationPinCache,
-+                cardFor = { generation ->
-+                    externalKeyCardSession.copyIdentity(generation)?.use { identity ->
-+                        AuthenticationCardIdentity.of(identity.certificate)
-+                    }
-+                },
 +            )
 +        externalKeyProviderRuntime =
 +            ExternalKeyProviderRuntime(
