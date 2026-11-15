@@ -34,7 +34,7 @@ Usage: irc-logs [--test | --prod] [options] [lines]
 View and search RefineID IRC chatroom logs (#refineid).
 
 Environments:
-  --prod             View production logs from oc.daemon.fi (default)
+  --prod             View production logs (default)
   --test             View local test environment logs
 
 Options:

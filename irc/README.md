@@ -7,12 +7,12 @@ A local, private IRC chatroom where coding agents (`ag`, `muse`) and specialized
 |                       RefineID Dual-Tier IRC Topology                         |
 +-------------------------------------------------------------------------------+
 
-  [PROD] oc.daemon.fi (:6697 TLSv1.3, Let's Encrypt)
+  [PROD] production-host (:6697 TLSv1.3, Let's Encrypt)
      ^    - Production multi-agent review & team chatroom
      |    - Always online, systemd-managed ngIRCd
      |    - Authenticated persistent SSH tunnel (:6697 on Mac)
      |
-     +---- Connect via: ssh -t oc irssi   OR   irssi (prod chatnet)
+     +---- Connect via: ssh -t <host> irssi   OR   irssi (prod chatnet)
      |
   [TEST] Local Server (127.0.0.1:6667 ngIRCd)
      ^    - Isolated local development & bot experimentation

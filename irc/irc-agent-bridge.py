@@ -41,7 +41,7 @@ ENV_NAME = "prod"
 SERVER = "127.0.0.1"
 PORT = 6697
 USE_TLS = True
-TLS_SERVER_HOSTNAME = "oc.daemon.fi"
+TLS_SERVER_HOSTNAME = os.environ.get("IRC_TLS_HOST", "production-host")
 CHANNELS = ["#refineid"]
 SOCKET_PATH = "/tmp/irc-agent-bridge-prod.sock"
 DAEMON_LOG_FILE = "/tmp/irc-agent-bridge-prod.log"
@@ -55,6 +55,12 @@ SYMLINK_LOG_FILE = "/tmp/irc-channel-refineid.log"
 MUSE_BIN = os.environ.get("MUSE_BIN", os.path.expanduser("~/.local/bin/muse"))
 AGY_BIN = os.environ.get("AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", os.path.expanduser("~/src"))
+
+# Agent execution allowlist - only these nicks can trigger agent CLI execution
+# (agy/muse). Empty or unset means no allowlist (legacy behavior, NOT RECOMMENDED).
+# Example: AGENT_SENDER_ALLOWLIST="pk,petri" allows only those nicks.
+ALLOWLIST_ENV = os.environ.get("AGENT_SENDER_ALLOWLIST", "")
+AGENT_SENDER_ALLOWLIST = {nick.strip() for nick in ALLOWLIST_ENV.split(",") if nick.strip()}
 
 ALL_BOT_NICKS = ("ag", "antigravity", "agv", "muse", "ci", "gh", "builder", "build", "check", "card", "pcsc")
 
@@ -564,7 +570,7 @@ async def handle_card_query(sender, query):
         except Exception:
             pass
     else:
-        # Linux (e.g. oc.daemon.fi): Query opensc-tool
+        # Linux (e.g. production host): Query opensc-tool
         try:
             proc = await asyncio.create_subprocess_exec(
                 "opensc-tool", "-l",
@@ -986,7 +992,7 @@ class IrcBot:
                     client = genai.Client(api_key=gemini_api_key)
                     sys_inst = (
                         "You are Antigravity ('ag'), the official Google AI coding assistant on RefineID IRC (#refineid).\n"
-                        "You run as a permanent daemon on oc.daemon.fi.\n"
+                        f"You run as a permanent daemon on {TLS_SERVER_HOSTNAME}.\n"
                         "Follow AGENTS.md rules strictly:\n"
                         "- Zero PIN and PIN-length logging across all environments.\n"
                         "- Preserve ISO-8859-15 encoding and specification symbols (§).\n"
@@ -1008,34 +1014,39 @@ class IrcBot:
 
             # 2. Try CLI execution (agy or muse) if available
             if not reply:
-                cmd = None
-                if self.nick == "muse" and shutil.which(MUSE_BIN):
-                    cmd = [MUSE_BIN, "exec", "--yolo", full_prompt]
-                elif shutil.which(AGY_BIN):
-                    cmd = [AGY_BIN, "--dangerously-skip-permissions", "--print", full_prompt]
+                # Check sender allowlist for agent CLI execution
+                if AGENT_SENDER_ALLOWLIST and sender not in AGENT_SENDER_ALLOWLIST:
+                    log_daemon(f"[{self.nick}] Sender {sender} not in AGENT_SENDER_ALLOWLIST, skipping CLI execution")
+                    # Fall through to autonomous query
+                else:
+                    cmd = None
+                    if self.nick == "muse" and shutil.which(MUSE_BIN):
+                        cmd = [MUSE_BIN, "exec", "--yolo", full_prompt]
+                    elif shutil.which(AGY_BIN):
+                        cmd = [AGY_BIN, "--dangerously-skip-permissions", "--print", full_prompt]
 
-                if cmd:
-                    log_daemon(f"[{self.nick}] Executing CLI: {' '.join(cmd)}")
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        cwd=WORKSPACE_DIR
-                    )
-                    stdout, stderr = await proc.communicate()
-                    out_text = stdout.decode("utf-8", errors="replace")
-                    err_text = stderr.decode("utf-8", errors="replace")
+                    if cmd:
+                        log_daemon(f"[{self.nick}] Executing CLI: {' '.join(cmd)}")
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=WORKSPACE_DIR
+                        )
+                        stdout, stderr = await proc.communicate()
+                        out_text = stdout.decode("utf-8", errors="replace")
+                        err_text = stderr.decode("utf-8", errors="replace")
 
-                    if self.nick == "muse":
-                        lines = [l for l in out_text.splitlines() if not l.startswith("muse: workspace")]
-                        reply = "\n".join(lines).strip()
-                    else:
-                        reply = out_text.strip()
+                        if self.nick == "muse":
+                            lines = [l for l in out_text.splitlines() if not l.startswith("muse: workspace")]
+                            reply = "\n".join(lines).strip()
+                        else:
+                            reply = out_text.strip()
 
-                    if not reply and err_text:
-                        reply = f"stderr: {err_text.strip()}"
+                        if not reply and err_text:
+                            reply = f"stderr: {err_text.strip()}"
 
-            # 3. Built-in autonomous daemon intelligence on oc.daemon.fi
+                # 3. Built-in autonomous daemon intelligence on production host
             if not reply:
                 reply = await handle_autonomous_query(self.nick, sender, query)
 
@@ -1103,13 +1114,13 @@ async def handle_autonomous_query(nick, sender, query):
             except Exception:
                 pass
         if repos:
-            return f"Cloned repositories on oc.daemon.fi ({len(repos)}): " + ", ".join(repos)
+            return f"Cloned repositories on {TLS_SERVER_HOSTNAME} ({len(repos)}): " + ", ".join(repos)
         return "No local repositories cloned yet in " + WORKSPACE_DIR
 
     # 4. Default helpful response with Gemini API setup instructions
     return (
         f"I received your request: '{q}'.\n"
-        f"I am running as a permanent daemon on oc.daemon.fi. "
+        f"I am running as a permanent daemon on {TLS_SERVER_HOSTNAME}. "
         f"To enable direct generative Gemini LLM turns, set GEMINI_API_KEY in /home/pk/.config/refineid/env. "
         f"Available built-in commands: 'ci: prs', 'builder: status', 'card: status', 'ag: rules', 'ag: status'."
     )
@@ -1142,7 +1153,7 @@ def configure_environment():
         "--env",
         choices=["prod", "test", "local", "oc"],
         default=os.environ.get("IRC_ENV", "prod"),
-        help="Target environment: 'prod' (oc.daemon.fi, default) or 'test' (local)"
+        help="Target environment: 'prod' (production host, default) or 'test' (local)"
     )
     parser.add_argument("--test", action="store_const", const="test", dest="env", help="Shortcut for --env test")
     parser.add_argument("--prod", action="store_const", const="prod", dest="env", help="Shortcut for --env prod")
@@ -1150,7 +1161,7 @@ def configure_environment():
     parser.add_argument("--port", type=int, default=None, help="IRC server port (default: 6697 for prod, 6667 for test)")
     parser.add_argument("--tls", dest="use_tls", action="store_true", default=None, help="Force TLS encryption")
     parser.add_argument("--no-tls", dest="use_tls", action="store_false", help="Disable TLS encryption")
-    parser.add_argument("--tls-host", default=os.environ.get("IRC_TLS_HOST", "oc.daemon.fi"), help="TLS SNI hostname")
+    parser.add_argument("--tls-host", default=os.environ.get("IRC_TLS_HOST", "production-host"), help="TLS SNI hostname")
     parser.add_argument("--channel", action="append", dest="channels", help="Channel to join (default: #refineid)")
 
     args, _ = parser.parse_known_args()

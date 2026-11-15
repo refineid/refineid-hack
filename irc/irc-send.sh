@@ -56,6 +56,7 @@ s.close()
 else
   PORT=6697
   USE_TLS="tls"
+  TLS_HOSTNAME="${IRC_TLS_HOST:-production-host}"
   if [[ "$ENV_NAME" == "test" ]]; then
     PORT=6667
     USE_TLS="plain"
@@ -66,7 +67,8 @@ else
 import os, re, socket, ssl, sys
 use_tls = sys.argv[1] == "tls"
 port = int(sys.argv[2])
-nick, channel, message = (os.fsencode(v) for v in sys.argv[3:6])
+tls_host = sys.argv[3]
+nick, channel, message = (os.fsencode(v) for v in sys.argv[4:7])
 out = b"NICK " + nick + b"\r\nUSER " + nick + b" 0 * :Bot\r\nJOIN " + channel + b"\r\n"
 for line in re.split(rb"\r\n|\r|\n", message):
     if line:
@@ -74,12 +76,12 @@ for line in re.split(rb"\r\n|\r|\n", message):
 out += b"QUIT :bye\r\n"
 if use_tls:
     ctx = ssl.create_default_context()
-    s = ctx.wrap_socket(socket.socket(), server_hostname="oc.daemon.fi")
+    s = ctx.wrap_socket(socket.socket(), server_hostname=tls_host)
     s.connect(("127.0.0.1", port))
 else:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(("127.0.0.1", port))
 s.sendall(out)
 s.close()
-' "$USE_TLS" "$PORT" "$BOT" "$CHANNEL" "$MESSAGE" 2>/dev/null || true
+' "$USE_TLS" "$PORT" "$TLS_HOSTNAME" "$BOT" "$CHANNEL" "$MESSAGE" 2>/dev/null || true
 fi

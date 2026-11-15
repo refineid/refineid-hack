@@ -4,38 +4,42 @@ set -eu
 
 usage() {
   cat <<'USAGE' >&2
-Usage: fetch_suomi_occupation.sh <PIN1> [lang=en|fi|sv] [ssh_host=kali]
+Usage: fetch_suomi_occupation.sh [lang=en|fi|sv] [ssh_host=reader-host]
 
-The script logs in to suomi.fi with a local card reader, through `ssh kali`
-by default, and prints:
-Use `local` as ssh_host to execute directly on this host.
-If `kali` is not reachable, check SSH config and run with `local`.
+The script reads PIN1 from stdin (first line), then logs in to suomi.fi
+with a local card reader, through `ssh reader-host` by default, and prints:
 
   Your occupation: <profession>
+
+Use `local` as ssh_host to execute directly on this host.
+If `reader-host` is not reachable, check SSH config and run with `local`.
 
 Requirements:
   - openssl (for card mTLS request on kortti.tunnistautuminen.suomi.fi)
   - reader stack (pcsc_scan is optional but helpful)
-  - for environments without openssl pkcs11/provider support: export OPENSSL_CLIENT_CERT/OPENSSL_CLIENT_KEY as PEM files
+  - for environments without openssl pkcs11/provider support:
+    export OPENSSL_CLIENT_CERT/OPENSSL_CLIENT_KEY as PEM files
 
 Optional:
   USB_RAW_APDU=1  (attempt direct raw USB APDU path)
                     (requires usb_ioctl_helper and USB_IOCTL_ARGS)
- 
+
 Raw USB/APDU mode:
   - This script can inspect /dev/bus/usb and reader devices.
-  - Full APDU transport over /dev/bus/usb requires USBFS ioctls and cannot be done with plain read/write.
+  - Full APDU transport over /dev/bus/usb requires USBFS ioctls and
+    cannot be done with plain read/write.
   - Set USB_IOCTL_ARGS to pass arguments to `usb_ioctl_helper`.
   - Example:
     USB_IOCTL_ARGS='control-in 0xA1 0x00 0x0000 0x0000 18'
-    USB_RAW_APDU=1 ./fetch_suomi_occupation.sh <PIN1> <lang> <host>
+    USB_RAW_APDU=1 ./fetch_suomi_occupation.sh <lang> <host> <pin.txt
   - Helper binary default: ./usb_ioctl_helper (set USB_IOCTL_HELPER)
 USAGE
 }
 
-PIN1="${1:-${REFINEID_PIN1:-}}"
-LANGUAGE="${2:-en}"
-SSH_HOST="${3:-kali}"
+# Read PIN1 from stdin (first line only), not from argv/env
+IFS= read -r PIN1
+LANGUAGE="${1:-en}"
+SSH_HOST="${2:-reader-host}"
 ALLOW_PKCS11="${ALLOW_PKCS11:-1}"
 
 USB_IOCTL_ARGS_B64="$(printf '%s' "${USB_IOCTL_ARGS:-}" | base64 | tr -d '\n')"
@@ -63,16 +67,25 @@ fi
 
 if [ "$SSH_HOST" = "local" ] || [ "$SSH_HOST" = "localhost" ] || [ "$SSH_HOST" = "127.0.0.1" ] || [ "$SSH_HOST" = "::1" ]; then
   export USB_RAW_APDU USB_RAW_NODE USB_IOCTL_ARGS USB_IOCTL_ARGS_B64 USB_IOCTL_HELPER ALLOW_PKCS11 OPENSSL_CLIENT_CERT OPENSSL_CLIENT_KEY PKCS11_CERT_URI PKCS11_KEY_URI OPENSSL_PKCS11_ENGINE REFINEID_OPENSSL
+  # Pass PIN1 via stdin to the worker block
+  worker_tmp="$(mktemp)"
   awk '
     BEGIN { in_block = 0 }
     /^# __SUOMI_WORKER_START__$/ { in_block = 1; next }
     /^# __SUOMI_WORKER_END__$/ { in_block = 0; next }
     in_block { print }
-  ' "$0" | sh -s -- "$PIN1" "$LANGUAGE"
-  exit $?
+  ' "$0" > "$worker_tmp"
+  printf '%s\n' "$PIN1" | sh "$worker_tmp" "$LANGUAGE"
+  rc=$?
+  rm -f "$worker_tmp"
+  exit $rc
 fi
 
-ssh "$SSH_HOST" env \
+# Pass PIN1 via stdin to remote (PIN1 as first line, then worker script)
+{
+  printf '%s\n' "$PIN1"
+  cat
+} <<'REMOTE_SH' | ssh "$SSH_HOST" env \
   USB_RAW_APDU="${USB_RAW_APDU:-}" \
   USB_RAW_NODE="${USB_RAW_NODE:-}" \
   USB_IOCTL_ARGS_B64="${USB_IOCTL_ARGS_B64:-}" \
@@ -84,12 +97,16 @@ ssh "$SSH_HOST" env \
   PKCS11_KEY_URI="${PKCS11_KEY_URI:-}" \
   OPENSSL_PKCS11_ENGINE="${OPENSSL_PKCS11_ENGINE:-}" \
   REFINEID_OPENSSL="${REFINEID_OPENSSL:-}" \
-  sh -s -- "$PIN1" "$LANGUAGE" <<'REMOTE_SH'
+  sh -c 'IFS= read -r PIN1; export PIN1; exec sh -s -- "$@"' sh "$LANGUAGE"
+exit $?
 # __SUOMI_WORKER_START__
 set -eu
 
-PIN1=$1
-LANGUAGE=$2
+# Read PIN1 from stdin (first line) if not already provided
+if [ -z "${PIN1:-}" ]; then
+  IFS= read -r PIN1
+fi
+LANGUAGE=$1
 if [ -n "${USB_IOCTL_ARGS_B64:-}" ]; then
   USB_IOCTL_ARGS="$(printf '%s' "$USB_IOCTL_ARGS_B64" | base64 -d)"
 else

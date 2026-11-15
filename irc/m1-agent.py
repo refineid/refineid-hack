@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 m1-agent.py - Dedicated persistent IRC agent daemon for m1.local.
-Connects to #refineid on oc.daemon.fi as nickname 'm1' (Antigravity on m1.local).
+Connects to #refineid on production host as nickname 'm1' (Antigravity on m1.local).
 Acts based on IRC discussion, executes local cargo builds, tests, clippy,
 git operations, and Antigravity/Muse tasks directly in /Users/pk/src/refineid-windows.
 
@@ -32,7 +32,7 @@ import time
 SERVER = "127.0.0.1"
 PORT = 6697
 USE_TLS = True
-TLS_SERVER_HOSTNAME = "oc.daemon.fi"
+TLS_SERVER_HOSTNAME = os.environ.get("IRC_TLS_HOST", "production-host")
 CHANNELS = ["#refineid"]
 NICK = "m1"
 REALNAME = "Antigravity Agent on m1.local (macOS)"

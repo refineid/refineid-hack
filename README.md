@@ -61,24 +61,24 @@ everywhere.
 ## Usage
 
 ```sh
-./fetch_suomi_occupation.sh <PIN1> [lang=en|fi|sv] [ssh_host=kali]
+./fetch_suomi_occupation.sh [lang=en|fi|sv] [ssh_host=reader-host] <pin.txt
 ```
 
 Examples:
 
 ```sh
-REFINEID_PIN1=1234 ./fetch_suomi_occupation.sh
-./fetch_suomi_occupation.sh 1234 fi kali
+REFINEID_PIN1=1234 ./fetch_suomi_occupation.sh fi reader-host <pin.txt
+./fetch_suomi_occupation.sh fi reader-host <pin.txt
 ```
 
 ### Example (POSIX shell only)
 
 ```sh
-./fetch_suomi_occupation.sh 456789 fi kali
-ALLOW_PKCS11=1 ./fetch_suomi_occupation.sh 456789 fi kali
+./fetch_suomi_occupation.sh fi reader-host <pin.txt
+ALLOW_PKCS11=1 ./fetch_suomi_occupation.sh fi reader-host <pin.txt
 ```
 
-On Kali with reader+card present, card metadata and object URIs are printed from
+On Linux with reader+card present, card metadata and object URIs are printed from
 `/dev/bus/usb` and `pcsc_scan` before running the auth chain.
 
 ## Minimal ioctl helper (Linux /dev/bus/usb)
@@ -89,7 +89,7 @@ Build helper:
 cc -O2 -Wall -Wextra -o usb_ioctl_helper usb_ioctl_helper.c
 ```
 
-Build this on Kali/Linux (the helper uses `<linux/usbdevice_fs.h>` and USBFS ioctls).
+Build this on Linux (the helper uses `<linux/usbdevice_fs.h>` and USBFS ioctls).
 
 Example from shell:
 
@@ -112,7 +112,7 @@ Use from the script:
 USB_IOCTL_HELPER=./usb_ioctl_helper \
 USB_IOCTL_ARGS='--interface 0 control-in 0xA1 0x00 0x0000 0x0000 18' \
 USB_RAW_APDU=1 \
-./fetch_suomi_occupation.sh 456789 fi local
+./fetch_suomi_occupation.sh fi local <pin.txt
 ```
 
 In this mode, the script calls the helper at startup to verify USB access before continuing
