@@ -5,8 +5,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
-import fi.refineid.android.core.AuthenticationCardIdentity
-import fi.refineid.android.core.AuthenticationPinCache
 import fi.refineid.android.core.Pin1Submission
 import fi.refineid.android.diagnostics.AppTrace
 import java.util.concurrent.CompletableFuture
@@ -70,13 +68,11 @@ internal data class ExternalKeyPinPromptView(
 
 /**
  * Process-memory rendezvous between a synchronous KeyChain call and secure
- * UI. [cardFor] names the card that publishes a provider generation.
+ * UI.
  */
 internal class ExternalKeyPinPromptBroker(
     context: Context,
     private val callerLabelResolver: ExternalKeyCallerLabelResolver,
-    private val pinCache: AuthenticationPinCache,
-    private val cardFor: (ExternalKeyProviderGeneration) -> AuthenticationCardIdentity?,
     private val mainHandler: Handler = Handler(Looper.getMainLooper()),
     private val timeoutMilliseconds: Long = DEFAULT_TIMEOUT_MILLISECONDS,
 ) : ExternalKeyPinAuthorizer {
@@ -99,13 +95,6 @@ internal class ExternalKeyPinPromptBroker(
         val callerLabel =
             callerLabelResolver.resolve(request.caller)
                 ?: return ExternalKeyPinAuthorization.Unavailable
-        // A PIN1 the holder already proved on the card that serves this
-        // request authorizes the signature silently, so repeated signatures
-        // stay silent while that card is held, as in the in-app browser path.
-        // A PIN1 held for another card is not offered; the holder is asked.
-        cardFor(request.providerGeneration)?.let(pinCache::take)?.let { storedPin ->
-            return ExternalKeyPinAuthorization.Approved(storedPin)
-        }
         val prompt =
             synchronized(lock) {
                 if (isClosed || pendingPrompt != null) {

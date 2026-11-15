@@ -612,25 +612,18 @@ bool create_identity(const std::string &directory) {
     return done;
 }
 
-// Returns the expected Proxy-Authorization value, creating the secret once.
+// Returns the expected Proxy-Authorization value, creating a fresh secret for
+// each start so a secret learned from another listener does not outlive it.
 bool load_credentials(const std::string &directory) {
     const std::string path = directory + "/proxy-secret";
     std::string secret;
-    if (!read_file(path, &secret)) {
-        unsigned char random[kSecretBytes];
-        if (RAND_bytes(random, sizeof(random)) != 1) {
-            return false;
-        }
-        secret = base64(random, sizeof(random));
-        OPENSSL_cleanse(random, sizeof(random));
-        if (!write_private_file(path, secret + "\n")) {
-            return false;
-        }
+    unsigned char random[kSecretBytes];
+    if (RAND_bytes(random, sizeof(random)) != 1) {
+        return false;
     }
-    while (!secret.empty() && (secret.back() == '\n' || secret.back() == '\r')) {
-        secret.pop_back();
-    }
-    if (secret.empty()) {
+    secret = base64(random, sizeof(random));
+    OPENSSL_cleanse(random, sizeof(random));
+    if (!write_private_file(path, secret + "\n")) {
         return false;
     }
     const std::string pair = "refineid:" + secret;
