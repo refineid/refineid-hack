@@ -16,6 +16,10 @@ Bluetooth LE, including the pairing offer read; see its README.
 `fetch_suomi_occupation.sh` implements a self-contained suomi.fi login chain over an
 SSHed host and fetches `value.profession` from the authenticated personal-data API.
 
+`gemini_priority_proxy.py` is a local OpenAI-compatible proxy in front of the
+Gemini API that sets `service_tier` for clients that cannot configure it; its
+header documents the usage. The API key comes from the environment.
+
 ## Rules of this repository
 
 This is where the shortcuts go that the RefineID product repositories forbid: a
