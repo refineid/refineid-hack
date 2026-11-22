@@ -6,3 +6,6 @@
 __pycache__/
 /aosp-keychain-external-key/aosp-prebuilt/
 *.py[cod]
+
+# Finder metadata
+.DS_Store
