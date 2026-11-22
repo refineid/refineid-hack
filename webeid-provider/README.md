@@ -3,7 +3,9 @@
 Answers the Web eID requests of the Estonian state authentication service
 (TARA) with a card read through the RefineID PKCS#11 module. It is the
 piece that makes `www.eesti.ee` login work in Firefox on FreeBSD, where
-the official Web eID native application has no build.
+the official Web eID native application has no build. The observed TARA
+flow, the message contract and the token fields are recorded in
+[TARA-LOGIN.md](TARA-LOGIN.md).
 
 ## How a login flows
 
