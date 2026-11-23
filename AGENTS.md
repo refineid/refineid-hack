@@ -43,12 +43,18 @@ apply. See "Rules of this repository" in the README.
   required checks pass. Sync local `main` with the merged remote.
   Use squash merges to keep the `main` history linear; do not use merge commits.
 
-## Record deferred findings
+## File bugs when problems are seen
 
-- While working, file a GitHub issue in the owning repository for each
-  confirmed, actionable defect or quality gap that cannot reasonably be
-  fixed within the current task. Filing these issues is authorized; do not
-  wait for a separate instruction for each finding.
+- Standing instruction: as soon as you observe a confirmed bug, broken
+  tool, documentation defect, or secret-handling flaw (outside the
+  product-standard shortcuts and throwaway experiments allowed by "What
+  this repository is" above), file a GitHub issue (`gh issue create`,
+  with `-R <owner>/<repo>` when filing from another checkout) immediately
+  in the owning repository with sanitized evidence, without waiting for
+  user permission or the end of the task, whether the fix will happen next
+  or in a later branch (following the secrecy, personal-data, and
+  security-reporting rules below). Do not file issues for defects in the current branch's own
+  unmerged changes; fix those in the branch.
 - Search existing open issues first. Reuse the matching issue and add only
   new, useful evidence instead of creating a duplicate. Group findings only
   when they share a cause and can be resolved by one focused change.
