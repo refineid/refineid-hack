@@ -2,9 +2,13 @@
 """Cross-platform installer registering RefineID as the `eu.webeid` native host.
 
 Installs host.py, a platform launcher (host.cmd on Windows, host.sh on POSIX),
-config.json pointing at the RefineID PKCS#11 module, and native messaging
+optional config.json (PKCS#11 module path on POSIX), and native messaging
 manifests allowing the official store-signed Web eID browser extensions in
 Microsoft Edge, Google Chrome and Mozilla Firefox.
+
+On Windows, host.py signs via Windows CNG (Microsoft Smart Card Key Storage
+Provider) so Windows renders the native Windows Security Smart Card PIN prompt
+and no PKCS#11 DLL path is required.
 """
 
 from __future__ import annotations
@@ -47,15 +51,14 @@ def default_destination() -> Path:
 
 def candidate_pkcs11_paths() -> list[Path]:
     home = Path.home()
-    if IS_WINDOWS:
-        return [
-            home / "src" / "refineid-windows" / "target" / "release" / "refineid_pkcs11.dll",
-            home / "src" / "refineid-windows" / "target" / "debug" / "refineid_pkcs11.dll",
-            Path(r"C:\Program Files\RefineID\refineid_pkcs11.dll"),
-        ]
     if sys.platform == "darwin":
         return [
-            home / "src" / "refineid-core" / "target" / "release" / "librefineid_pkcs11.dylib",
+            home
+            / "src"
+            / "refineid-core"
+            / "target"
+            / "release"
+            / "librefineid_pkcs11.dylib",
             Path("/usr/local/lib/librefineid_pkcs11.dylib"),
         ]
     return [
@@ -200,7 +203,7 @@ def install(
     *,
     source_dir: Path,
     dest: Path,
-    pkcs11_module: Path,
+    pkcs11_module: Path | None,
     model: str,
     register: bool,
     python_executable: str = sys.executable,
@@ -215,11 +218,13 @@ def install(
         )
 
     config_path = dest / "config.json"
-    config_path.write_text(
-        json.dumps({"pkcs11_module": str(pkcs11_module), "model": model}, indent=2)
-        + "\n",
-        encoding="utf-8",
-    )
+    if windows:
+        config_data: dict[str, Any] = {"backend": "windows-cng"}
+    else:
+        if pkcs11_module is None:
+            raise ValueError("pkcs11_module is required on POSIX")
+        config_data = {"pkcs11_module": str(pkcs11_module), "model": model}
+    config_path.write_text(json.dumps(config_data, indent=2) + "\n", encoding="utf-8")
 
     launcher = write_launcher(dest, python_executable, windows=windows)
     firefox_manifest, chromium_manifest = write_native_manifests(dest, launcher)
@@ -230,7 +235,8 @@ def install(
         "destination": str(dest),
         "launcher": str(launcher),
         "config": str(config_path),
-        "pkcs11_module": str(pkcs11_module),
+        "backend": "windows-cng" if windows else "pkcs11",
+        "pkcs11_module": str(pkcs11_module) if pkcs11_module is not None else None,
         "firefox_manifest": str(firefox_manifest),
         "chromium_manifest": str(chromium_manifest),
         "registered": registered,
@@ -250,12 +256,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pkcs11",
         default=None,
-        help="Path to the RefineID PKCS#11 shared library.",
+        help="Path to the RefineID PKCS#11 shared library (POSIX only).",
     )
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help="PKCS#11 token model to select (default: ESTeID).",
+        help="PKCS#11 token model to select on POSIX (default: ESTeID).",
     )
     parser.add_argument(
         "--no-registry",
@@ -268,7 +274,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     source_dir = Path(__file__).resolve().parent
-    pkcs11_module = resolve_pkcs11_module(args.pkcs11)
+    pkcs11_module = None if IS_WINDOWS else resolve_pkcs11_module(args.pkcs11)
     summary = install(
         source_dir=source_dir,
         dest=args.dest.expanduser().resolve(),
@@ -277,7 +283,9 @@ def main(argv: list[str] | None = None) -> int:
         register=not args.no_registry,
     )
     print(f"Host installed in: {summary['destination']}")
-    print(f"PKCS#11 module:    {summary['pkcs11_module']}")
+    print(f"Backend:           {summary['backend']}")
+    if summary["pkcs11_module"]:
+        print(f"PKCS#11 module:    {summary['pkcs11_module']}")
     for entry in summary["registered"]:
         print(f"Registered:        {entry}")
     return 0

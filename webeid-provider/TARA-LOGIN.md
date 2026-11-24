@@ -1,8 +1,10 @@
 # TARA login flow and token contract
 
-Observed on `www.eesti.ee` -> `tara.ria.ee` with an Estonian eID card,
-an ACS ACR39U reader and the RefineID PKCS#11 module. The `eu.webeid` native
-host in this directory answers the official Web eID browser extension.
+Observed on `www.eesti.ee` -> `tara.ria.ee` with an Estonian eID card and
+an ACS ACR39U reader. The `eu.webeid` native host in this directory answers
+the official Web eID browser extension using Windows CNG (native Windows
+Security Smart Card PIN prompt) on Windows and RefineID's PKCS#11 module on
+POSIX.
 
 ## Flow
 
@@ -42,33 +44,22 @@ The official Web eID browser extension connects to native host `eu.webeid`:
 ## Token
 
 - `unverifiedCertificate`: base64 DER authentication certificate.
-- `algorithm`: `ES384`.
-- `signature`: base64 raw 96-byte ECDSA `r||s`.
-- Signed data: `SHA-384(origin) + SHA-384(challenge)`, signed as ES384
-  (the host hashes the 96-byte value with SHA-384 and passes the 48-byte
-  digest to `CKM_ECDSA`). Origin is `https://tara.ria.ee`.
+- `algorithm`: `ES384` (or `ES256`/`ES512`/`RS256` matching the card key).
+- `signature`: base64 raw ECDSA `r||s` (96 bytes for P-384) or RSA PKCS#1 v1.5.
+- Signed data: `H(origin) + H(challenge)`, hashed again with `H` before
+  signing (`SHA-384` for `ES384`). Origin is `https://tara.ria.ee`.
 - `format`: `web-eid:1.0`.
 - `appVersion`: informative.
 
-The card signs with PIN1 and `CKM_ECDSA` through the RefineID PKCS#11
-module, which returns the raw 96-byte `r||s` directly.
+Both Windows CNG `NCryptSignHash` and RefineID PKCS#11 `CKM_ECDSA` return raw
+`r||s` directly for ECDSA keys.
 
 ## Reproduce
 
 1. Install the official **Web eID** extension in Edge or Firefox.
-2. Run:
-
-```sh
-python3 install.py --pkcs11 /path/to/refineid_pkcs11.dll
-```
-
+2. Run `python install.py` on Windows (or `python3 install.py --pkcs11 ...` on POSIX).
 3. Open `www.eesti.ee`, choose self-service, keep the ID-card tab, press
-   Continue, and enter PIN1 in the local **RefineID Web eID** dialog.
-
-The host logs nothing, requires a canonical `https://` origin, prompts locally
-for PIN1 in a masked dialog (zeroing its mutable PIN buffer right after
-`C_Login`), and on POSIX refuses any `REFINEID_WEBEID_PIN_FILE` readable by
-group or others.
+   Continue, and enter PIN1 in the native Windows Security prompt.
 
 Sources: TARA page and script, observed; official `web-eid-webextension` 2.5.0;
 Web eID authentication token format specification,

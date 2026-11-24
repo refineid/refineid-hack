@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Official Web eID (`eu.webeid`) native messaging host backed by RefineID PKCS#11.
+"""Official Web eID (`eu.webeid`) native messaging host.
 
 Implements the native messaging protocol spoken by the official store-signed
 Web eID browser extension (`web-eid-webextension` 2.x) for Microsoft Edge,
@@ -7,14 +7,14 @@ Google Chrome and Mozilla Firefox:
 
 1. Immediately writes `{"version": "2.5.0"}` on startup.
 2. Handles `{"command": "quit", "arguments": {}}` by replying `{}` and exiting.
-3. Handles `{"command": "authenticate", "arguments": {"challengeNonce", "origin"}}`
-   by loading the RefineID PKCS#11 module directly via ctypes, selecting the
-   ESTeID token, prompting for PIN1 in a topmost local dialog showing the exact
-   origin, computing SHA-384(SHA-384(origin) || SHA-384(challengeNonce)),
-   signing with CKM_ECDSA, and returning the Web eID 1.0 authentication token.
+3. Handles `{"command": "authenticate", "arguments": {"challengeNonce", "origin"}}`:
+   - On Windows, signs via Windows CNG (`Microsoft Smart Card Key Storage
+     Provider` / `NCryptSignHash`), so Windows 11 renders the native Windows
+     Security Smart Card PIN dialog and PIN1 never enters this process.
+   - On POSIX (FreeBSD/Linux/macOS), talks directly to the RefineID PKCS#11
+     v2.40 module via ctypes.
 
-The PIN stays on the machine in a zeroed bytearray; the host never logs,
-prints or returns it, nor any cardholder data or challenge.
+The host never logs or returns PIN data, cardholder data or challenges.
 """
 
 from __future__ import annotations
@@ -33,10 +33,18 @@ from urllib.parse import urlsplit
 
 # ---- Web eID protocol constants ----
 
-EC_SIGNATURE_BYTES = 96
+EC_P256_BITS = 256
+EC_P384_BITS = 384
+EC_P521_BITS = 521
+EC_P256_SIG_BYTES = 64
+EC_P384_SIG_BYTES = 96
+EC_P521_SIG_BYTES = 132
 SHA384_DIGEST_BYTES = 48
 MIN_CHALLENGE_LENGTH = 32
+ALGORITHM_ES256 = "ES256"
 ALGORITHM_ES384 = "ES384"
+ALGORITHM_ES512 = "ES512"
+ALGORITHM_RS256 = "RS256"
 TOKEN_FORMAT = "web-eid:1.0"
 NATIVE_VERSION = "2.5.0"
 APP_VERSION = f"https://refineid.fi/webeid/v{NATIVE_VERSION}"
@@ -62,7 +70,49 @@ NEWLINE_BYTES = (ASCII_LF, ASCII_CR)
 ASCII_PRINTABLE_MIN = 0x21
 ASCII_PRINTABLE_MAX = 0x7E
 
-# ---- PKCS#11 v2.40 constants (OASIS pkcs11t.h) ----
+IS_WINDOWS = sys.platform == "win32"
+
+# ---- Windows CNG / CryptoAPI constants (wincrypt.h / ncrypt.h / winerror.h) ----
+
+CERT_STORE_PROV_MEMORY = 2
+CERT_STORE_PROV_SYSTEM_W = 10
+CERT_SYSTEM_STORE_CURRENT_USER = 0x00010000
+CERT_STORE_READONLY_FLAG = 0x00008000
+CERT_STORE_ADD_USE_EXISTING = 2
+CERT_KEY_PROV_INFO_PROP_ID = 2
+CRYPT_ACQUIRE_SILENT_FLAG = 0x00000040
+CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG = 0x00040000
+NCRYPT_SILENT_FLAG = 0x00000040
+BCRYPT_PAD_PKCS1 = 0x00000002
+SMART_CARD_KSP = "Microsoft Smart Card Key Storage Provider"
+OID_CLIENT_AUTH = b"1.3.6.1.5.5.7.3.2"
+
+NCRYPT_PROP_ALGORITHM_NAME = "Algorithm Name"
+NCRYPT_PROP_LENGTH = "Length"
+NCRYPT_PROP_USE_CONTEXT = "Use Context"
+NCRYPT_PROP_WINDOW_HANDLE = "HWND Handle"
+BCRYPT_SHA256_ALGORITHM = "SHA256"
+
+WIN_STATUS_MASK = 0xFFFFFFFF
+WIN_ERROR_SUCCESS = 0x00000000
+WIN_NTE_USER_CANCELLED = 0x80090036
+WIN_SCARD_W_CANCELLED_BY_USER = 0x8010006E
+WIN_HRESULT_ERROR_CANCELLED = 0x800704C7
+WIN_SCARD_W_CHV_BLOCKED = 0x8010006C
+WIN_SCARD_W_WRONG_CHV = 0x8010006B
+WIN_SCARD_W_REMOVED_CARD = 0x80100069
+WIN_SCARD_E_NO_SMARTCARD = 0x8010000C
+WIN_SCARD_E_NO_READERS_AVAILABLE = 0x8010002E
+
+WIN_CANCELLED_STATUSES = frozenset(
+    {
+        WIN_NTE_USER_CANCELLED,
+        WIN_SCARD_W_CANCELLED_BY_USER,
+        WIN_HRESULT_ERROR_CANCELLED,
+    }
+)
+
+# ---- PKCS#11 v2.40 constants (OASIS pkcs11t.h, used on POSIX) ----
 
 PKCS11_VERSION_MAJOR = 2
 PKCS11_VERSION_MINOR = 40
@@ -106,8 +156,6 @@ TOKEN_MANUFACTURER_LEN = 32
 TOKEN_MODEL_LEN = 16
 TOKEN_SERIAL_LEN = 16
 TOKEN_UTC_TIME_LEN = 16
-
-IS_WINDOWS = sys.platform == "win32"
 
 # ---- PKCS#11 v2.40 C ABI types ----
 
@@ -383,16 +431,65 @@ def validate_https_origin(origin: Any, allowlist: frozenset[str] | None = None) 
         or parsed.query
         or parsed.fragment
     ):
-        raise HostError("origin must be an HTTPS origin", code=ERROR_CODE_INVALID_ARGUMENT)
+        raise HostError(
+            "origin must be an HTTPS origin", code=ERROR_CODE_INVALID_ARGUMENT
+        )
     try:
         _ = parsed.port
     except ValueError as exc:
-        raise HostError("origin port is invalid", code=ERROR_CODE_INVALID_ARGUMENT) from exc
+        raise HostError(
+            "origin port is invalid", code=ERROR_CODE_INVALID_ARGUMENT
+        ) from exc
     if origin != f"https://{parsed.netloc}":
         raise HostError("origin is not canonical", code=ERROR_CODE_INVALID_ARGUMENT)
     if allowlist is not None and origin not in allowlist:
         raise HostError("origin is not allowed", code=ERROR_CODE_INVALID_ARGUMENT)
     return origin
+
+
+def select_web_eid_algorithm(
+    algorithm_name: str, key_bits: int
+) -> tuple[str, str, int | None]:
+    """Map CNG key algorithm and bit length to (Web eID alg, hash name, ec sig bytes)."""
+    upper = algorithm_name.upper()
+    if upper.startswith("EC"):
+        if key_bits == EC_P384_BITS:
+            return ALGORITHM_ES384, "sha384", EC_P384_SIG_BYTES
+        if key_bits == EC_P256_BITS:
+            return ALGORITHM_ES256, "sha256", EC_P256_SIG_BYTES
+        if key_bits == EC_P521_BITS:
+            return ALGORITHM_ES512, "sha512", EC_P521_SIG_BYTES
+        raise HostError("unsupported elliptic-curve key size")
+    if upper == "RSA":
+        return ALGORITHM_RS256, "sha256", None
+    raise HostError("unsupported authentication key algorithm")
+
+
+def compute_web_eid_tbs_hash(
+    origin: str, challenge: str, hash_name: str = "sha384"
+) -> bytes:
+    """Compute H(H(origin) || H(challenge)) for Web eID authentication signing."""
+    origin_digest = hashlib.new(hash_name, origin.encode("utf-8")).digest()
+    challenge_digest = hashlib.new(hash_name, challenge.encode("utf-8")).digest()
+    return hashlib.new(hash_name, origin_digest + challenge_digest).digest()
+
+
+def classify_windows_cng_status(status: int) -> HostError:
+    """Map a Windows CNG SECURITY_STATUS code to a Web eID HostError."""
+    code = status & WIN_STATUS_MASK
+    if code in WIN_CANCELLED_STATUSES:
+        return HostError("PIN entry cancelled", code=ERROR_CODE_USER_CANCELLED)
+    if code == WIN_SCARD_W_CHV_BLOCKED:
+        return HostError("PIN1 is locked")
+    if code == WIN_SCARD_W_WRONG_CHV:
+        return HostError("PIN1 is incorrect")
+    if code in (
+        WIN_SCARD_W_REMOVED_CARD,
+        WIN_SCARD_E_NO_SMARTCARD,
+        WIN_SCARD_E_NO_READERS_AVAILABLE,
+    ):
+        return HostError("no smart card token is present")
+    return HostError(f"Windows smart card signing failed (0x{code:08x})")
 
 
 def read_message(stream: Any = None) -> dict[str, Any] | None:
@@ -432,6 +529,486 @@ def zero_bytearray(buffer: bytearray | None) -> None:
         return
     for index in range(len(buffer)):
         buffer[index] = 0
+
+
+# ---- Windows CNG backend (native Windows Security Smart Card PIN prompt) ----
+
+
+class WindowsCngProvider:
+    """Signs via Windows CNG Smart Card KSP so Windows renders the native PIN UI."""
+
+    def __init__(self) -> None:
+        if not IS_WINDOWS:
+            raise HostError("Windows CNG backend is only available on Windows")
+        from ctypes import wintypes
+
+        class CertContext(ctypes.Structure):
+            _fields_ = [
+                ("dwCertEncodingType", wintypes.DWORD),
+                ("pbCertEncoded", ctypes.POINTER(ctypes.c_ubyte)),
+                ("cbCertEncoded", wintypes.DWORD),
+                ("pCertInfo", ctypes.c_void_p),
+                ("hCertStore", ctypes.c_void_p),
+            ]
+
+        class CryptKeyProvInfo(ctypes.Structure):
+            _fields_ = [
+                ("pwszContainerName", wintypes.LPWSTR),
+                ("pwszProvName", wintypes.LPWSTR),
+                ("dwProvType", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("cProvParam", wintypes.DWORD),
+                ("rgProvParam", ctypes.c_void_p),
+                ("dwKeySpec", wintypes.DWORD),
+            ]
+
+        class CtlUsage(ctypes.Structure):
+            _fields_ = [
+                ("cUsageIdentifier", wintypes.DWORD),
+                ("rgpszUsageIdentifier", ctypes.POINTER(ctypes.c_char_p)),
+            ]
+
+        class BcryptPkcs1PaddingInfo(ctypes.Structure):
+            _fields_ = [("pszAlgId", wintypes.LPCWSTR)]
+
+        self._wintypes = wintypes
+        self._CertContext = CertContext
+        self._CryptKeyProvInfo = CryptKeyProvInfo
+        self._CtlUsage = CtlUsage
+        self._BcryptPkcs1PaddingInfo = BcryptPkcs1PaddingInfo
+
+        self._crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        self._ncrypt = ctypes.WinDLL("ncrypt", use_last_error=True)
+        self._cryptui = ctypes.WinDLL("cryptui", use_last_error=True)
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        p_cert = ctypes.POINTER(CertContext)
+        self._crypt32.CertOpenStore.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        self._crypt32.CertOpenStore.restype = ctypes.c_void_p
+        self._crypt32.CertCloseStore.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        self._crypt32.CertCloseStore.restype = wintypes.BOOL
+        self._crypt32.CertEnumCertificatesInStore.argtypes = [ctypes.c_void_p, p_cert]
+        self._crypt32.CertEnumCertificatesInStore.restype = p_cert
+        self._crypt32.CertDuplicateCertificateContext.argtypes = [p_cert]
+        self._crypt32.CertDuplicateCertificateContext.restype = p_cert
+        self._crypt32.CertFreeCertificateContext.argtypes = [p_cert]
+        self._crypt32.CertFreeCertificateContext.restype = wintypes.BOOL
+        self._crypt32.CertAddCertificateContextToStore.argtypes = [
+            ctypes.c_void_p,
+            p_cert,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        self._crypt32.CertAddCertificateContextToStore.restype = wintypes.BOOL
+        self._crypt32.CertVerifyTimeValidity.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self._crypt32.CertVerifyTimeValidity.restype = ctypes.c_long
+        self._crypt32.CertGetCertificateContextProperty.argtypes = [
+            p_cert,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self._crypt32.CertGetCertificateContextProperty.restype = wintypes.BOOL
+        self._crypt32.CertGetEnhancedKeyUsage.argtypes = [
+            p_cert,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self._crypt32.CertGetEnhancedKeyUsage.restype = wintypes.BOOL
+        self._crypt32.CryptAcquireCertificatePrivateKey.argtypes = [
+            p_cert,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        self._crypt32.CryptAcquireCertificatePrivateKey.restype = wintypes.BOOL
+
+        self._ncrypt.NCryptGetProperty.argtypes = [
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        self._ncrypt.NCryptGetProperty.restype = ctypes.c_long
+        self._ncrypt.NCryptSetProperty.argtypes = [
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        self._ncrypt.NCryptSetProperty.restype = ctypes.c_long
+        self._ncrypt.NCryptSignHash.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        self._ncrypt.NCryptSignHash.restype = ctypes.c_long
+        self._ncrypt.NCryptFreeObject.argtypes = [ctypes.c_void_p]
+        self._ncrypt.NCryptFreeObject.restype = ctypes.c_long
+
+        self._cryptui.CryptUIDlgSelectCertificateFromStore.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        self._cryptui.CryptUIDlgSelectCertificateFromStore.restype = p_cert
+
+        self._user32.GetForegroundWindow.argtypes = []
+        self._user32.GetForegroundWindow.restype = ctypes.c_void_p
+
+    def _is_smart_card_client_auth_cert(self, cert_ctx: Any) -> bool:
+        dw = self._wintypes.DWORD
+        if self._crypt32.CertVerifyTimeValidity(None, cert_ctx.contents.pCertInfo) != 0:
+            return False
+
+        cb = dw(0)
+        if not self._crypt32.CertGetCertificateContextProperty(
+            cert_ctx, CERT_KEY_PROV_INFO_PROP_ID, None, ctypes.byref(cb)
+        ):
+            return False
+        buf = (ctypes.c_ubyte * cb.value)()
+        if not self._crypt32.CertGetCertificateContextProperty(
+            cert_ctx, CERT_KEY_PROV_INFO_PROP_ID, buf, ctypes.byref(cb)
+        ):
+            return False
+        info = ctypes.cast(buf, ctypes.POINTER(self._CryptKeyProvInfo)).contents
+        if info.pwszProvName != SMART_CARD_KSP:
+            return False
+
+        # Require explicit id-kp-clientAuth EKU rather than treating an absent
+        # EKU (cUsageIdentifier == 0) as unrestricted: eID signing certificates
+        # (PIN2 non-repudiation) often omit EKU and must never be offered here.
+        eku_cb = dw(0)
+        if not self._crypt32.CertGetEnhancedKeyUsage(
+            cert_ctx, 0, None, ctypes.byref(eku_cb)
+        ) or eku_cb.value == 0:
+            return False
+        eku_buf = (ctypes.c_ubyte * eku_cb.value)()
+        if not self._crypt32.CertGetEnhancedKeyUsage(
+            cert_ctx, 0, eku_buf, ctypes.byref(eku_cb)
+        ):
+            return False
+        usage = ctypes.cast(eku_buf, ctypes.POINTER(self._CtlUsage)).contents
+        for index in range(usage.cUsageIdentifier):
+            if usage.rgpszUsageIdentifier[index] == OID_CLIENT_AUTH:
+                return True
+        return False
+
+    def _query_key_algorithm(self, hkey: ctypes.c_void_p) -> tuple[str, int]:
+        dw = self._wintypes.DWORD
+        alg_cb = dw(0)
+        st = self._ncrypt.NCryptGetProperty(
+            hkey, NCRYPT_PROP_ALGORITHM_NAME, None, 0, ctypes.byref(alg_cb), 0
+        )
+        if (st & WIN_STATUS_MASK) != WIN_ERROR_SUCCESS or alg_cb.value < 2:
+            raise HostError("failed to query smart card key algorithm")
+        alg_buf = ctypes.create_unicode_buffer(alg_cb.value // 2)
+        st = self._ncrypt.NCryptGetProperty(
+            hkey, NCRYPT_PROP_ALGORITHM_NAME, alg_buf, alg_cb.value, ctypes.byref(alg_cb), 0
+        )
+        if (st & WIN_STATUS_MASK) != WIN_ERROR_SUCCESS:
+            raise HostError("failed to query smart card key algorithm")
+
+        bits = dw(0)
+        bits_cb = dw(0)
+        st = self._ncrypt.NCryptGetProperty(
+            hkey,
+            NCRYPT_PROP_LENGTH,
+            ctypes.byref(bits),
+            ctypes.sizeof(bits),
+            ctypes.byref(bits_cb),
+            0,
+        )
+        if (st & WIN_STATUS_MASK) != WIN_ERROR_SUCCESS:
+            raise HostError("failed to query smart card key size")
+        return alg_buf.value, int(bits.value)
+
+    def _probe_candidate_live(
+        self, cert_ctx: Any
+    ) -> tuple[str, str, int | None, int] | None:
+        """Silently verify the card for cert_ctx is present and supports signing."""
+        dw = self._wintypes.DWORD
+        hkey = ctypes.c_void_p(0)
+        key_spec = dw(0)
+        caller_free = self._wintypes.BOOL(0)
+        ok = self._crypt32.CryptAcquireCertificatePrivateKey(
+            cert_ctx,
+            CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG,
+            None,
+            ctypes.byref(hkey),
+            ctypes.byref(key_spec),
+            ctypes.byref(caller_free),
+        )
+        if not ok or not hkey.value:
+            return None
+        try:
+            alg_name, key_bits = self._query_key_algorithm(hkey)
+            web_alg, hash_name, ec_sig_bytes = select_web_eid_algorithm(
+                alg_name, key_bits
+            )
+            digest_len = hashlib.new(hash_name).digest_size
+            dummy = (ctypes.c_ubyte * digest_len)()
+            sig_len = dw(0)
+            if ec_sig_bytes is None:
+                pad = self._BcryptPkcs1PaddingInfo(pszAlgId=BCRYPT_SHA256_ALGORITHM)
+                st = self._ncrypt.NCryptSignHash(
+                    hkey,
+                    ctypes.byref(pad),
+                    dummy,
+                    digest_len,
+                    None,
+                    0,
+                    ctypes.byref(sig_len),
+                    BCRYPT_PAD_PKCS1 | NCRYPT_SILENT_FLAG,
+                )
+            else:
+                st = self._ncrypt.NCryptSignHash(
+                    hkey,
+                    None,
+                    dummy,
+                    digest_len,
+                    None,
+                    0,
+                    ctypes.byref(sig_len),
+                    NCRYPT_SILENT_FLAG,
+                )
+            if (st & WIN_STATUS_MASK) != WIN_ERROR_SUCCESS or sig_len.value == 0:
+                return None
+            return web_alg, hash_name, ec_sig_bytes, key_bits
+        except HostError:
+            return None
+        finally:
+            if caller_free.value and hkey.value:
+                self._ncrypt.NCryptFreeObject(hkey)
+
+    def _collect_live_candidates(
+        self, store: ctypes.c_void_p
+    ) -> list[tuple[Any, str, str, int | None, int]]:
+        candidates: list[tuple[Any, str, str, int | None, int]] = []
+        ctx = None
+        while True:
+            ctx = self._crypt32.CertEnumCertificatesInStore(store, ctx)
+            if not ctx:
+                break
+            if not self._is_smart_card_client_auth_cert(ctx):
+                continue
+            probed = self._probe_candidate_live(ctx)
+            if probed is None:
+                continue
+            dup = self._crypt32.CertDuplicateCertificateContext(ctx)
+            if dup:
+                web_alg, hash_name, ec_sig_bytes, key_bits = probed
+                candidates.append((dup, web_alg, hash_name, ec_sig_bytes, key_bits))
+        return candidates
+
+    def _select_candidate(
+        self,
+        candidates: list[tuple[Any, str, str, int | None, int]],
+        origin: str,
+        hwnd: ctypes.c_void_p,
+    ) -> tuple[Any, str, str, int | None, int]:
+        if len(candidates) == 1:
+            return candidates[0]
+        mem_store = self._crypt32.CertOpenStore(
+            ctypes.c_void_p(CERT_STORE_PROV_MEMORY), 0, None, 0, None
+        )
+        if not mem_store:
+            return candidates[0]
+        try:
+            for cert_ctx, *_ in candidates:
+                self._crypt32.CertAddCertificateContextToStore(
+                    mem_store, cert_ctx, CERT_STORE_ADD_USE_EXISTING, None
+                )
+            chosen = self._cryptui.CryptUIDlgSelectCertificateFromStore(
+                mem_store,
+                hwnd,
+                "Web eID",
+                f"Select certificate to authenticate to {origin}",
+                0,
+                0,
+                None,
+            )
+            if not chosen:
+                raise HostError(
+                    "certificate selection cancelled",
+                    code=ERROR_CODE_USER_CANCELLED,
+                )
+            try:
+                chosen_der = ctypes.string_at(
+                    chosen.contents.pbCertEncoded, chosen.contents.cbCertEncoded
+                )
+            finally:
+                self._crypt32.CertFreeCertificateContext(chosen)
+            for entry in candidates:
+                cert_ctx = entry[0]
+                der = ctypes.string_at(
+                    cert_ctx.contents.pbCertEncoded, cert_ctx.contents.cbCertEncoded
+                )
+                if der == chosen_der:
+                    return entry
+            raise HostError("selected certificate is unavailable")
+        finally:
+            self._crypt32.CertCloseStore(mem_store, 0)
+
+    def probe(self) -> dict[str, Any]:
+        """Inspect live smart card auth cert via Windows CNG without prompting."""
+        store = self._crypt32.CertOpenStore(
+            ctypes.c_void_p(CERT_STORE_PROV_SYSTEM_W),
+            0,
+            None,
+            CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_READONLY_FLAG,
+            ctypes.c_wchar_p("MY"),
+        )
+        if not store:
+            raise HostError("failed to open Windows certificate store")
+        candidates: list[tuple[Any, str, str, int | None, int]] = []
+        try:
+            candidates = self._collect_live_candidates(store)
+            if not candidates:
+                raise HostError("no smart card authentication certificate is present")
+            cert_ctx, web_alg, _hash_name, _ec_sig, key_bits = candidates[0]
+            return {
+                "backend": "windows-cng",
+                "candidates": len(candidates),
+                "algorithm": web_alg,
+                "keyBits": key_bits,
+                "certBytes": int(cert_ctx.contents.cbCertEncoded),
+            }
+        finally:
+            for cert_ctx, *_ in candidates:
+                self._crypt32.CertFreeCertificateContext(cert_ctx)
+            self._crypt32.CertCloseStore(store, 0)
+
+    def authenticate(self, origin: str, challenge: str) -> tuple[bytes, str, bytes]:
+        """Sign Web eID challenge via Windows CNG with native Windows Security PIN UI."""
+        store = self._crypt32.CertOpenStore(
+            ctypes.c_void_p(CERT_STORE_PROV_SYSTEM_W),
+            0,
+            None,
+            CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_READONLY_FLAG,
+            ctypes.c_wchar_p("MY"),
+        )
+        if not store:
+            raise HostError("failed to open Windows certificate store")
+        candidates: list[tuple[Any, str, str, int | None, int]] = []
+        hkey = ctypes.c_void_p(0)
+        caller_free = self._wintypes.BOOL(0)
+        try:
+            candidates = self._collect_live_candidates(store)
+            if not candidates:
+                raise HostError("no smart card authentication certificate is present")
+
+            hwnd = ctypes.c_void_p(self._user32.GetForegroundWindow() or 0)
+            cert_ctx, web_alg, hash_name, ec_sig_bytes, _key_bits = (
+                self._select_candidate(candidates, origin, hwnd)
+            )
+            cert_der = ctypes.string_at(
+                cert_ctx.contents.pbCertEncoded, cert_ctx.contents.cbCertEncoded
+            )
+
+            dw = self._wintypes.DWORD
+            key_spec = dw(0)
+            ok = self._crypt32.CryptAcquireCertificatePrivateKey(
+                cert_ctx,
+                CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
+                None,
+                ctypes.byref(hkey),
+                ctypes.byref(key_spec),
+                ctypes.byref(caller_free),
+            )
+            if not ok or not hkey.value:
+                raise HostError("failed to open smart card private key")
+
+            if hwnd.value:
+                self._ncrypt.NCryptSetProperty(
+                    hkey,
+                    NCRYPT_PROP_WINDOW_HANDLE,
+                    ctypes.byref(hwnd),
+                    ctypes.sizeof(hwnd),
+                    0,
+                )
+            ctx_buf = ctypes.create_unicode_buffer(f"Authenticate to {origin}")
+            self._ncrypt.NCryptSetProperty(
+                hkey, NCRYPT_PROP_USE_CONTEXT, ctx_buf, ctypes.sizeof(ctx_buf), 0
+            )
+
+            tbs_hash = compute_web_eid_tbs_hash(origin, challenge, hash_name=hash_name)
+            digest_buf = (ctypes.c_ubyte * len(tbs_hash))(*tbs_hash)
+            sig_len = dw(0)
+
+            if ec_sig_bytes is None:
+                pad = self._BcryptPkcs1PaddingInfo(pszAlgId=BCRYPT_SHA256_ALGORITHM)
+                pad_ptr = ctypes.byref(pad)
+                sign_flags = BCRYPT_PAD_PKCS1
+            else:
+                pad_ptr = None
+                sign_flags = 0
+
+            st = self._ncrypt.NCryptSignHash(
+                hkey,
+                pad_ptr,
+                digest_buf,
+                len(tbs_hash),
+                None,
+                0,
+                ctypes.byref(sig_len),
+                sign_flags | NCRYPT_SILENT_FLAG,
+            )
+            if (st & WIN_STATUS_MASK) != WIN_ERROR_SUCCESS or sig_len.value == 0:
+                raise classify_windows_cng_status(st)
+
+            sig_buf = (ctypes.c_ubyte * sig_len.value)()
+            out_len = dw(0)
+            st = self._ncrypt.NCryptSignHash(
+                hkey,
+                pad_ptr,
+                digest_buf,
+                len(tbs_hash),
+                sig_buf,
+                sig_len.value,
+                ctypes.byref(out_len),
+                sign_flags,
+            )
+            if (st & WIN_STATUS_MASK) != WIN_ERROR_SUCCESS:
+                raise classify_windows_cng_status(st)
+
+            signature = bytes(sig_buf[: out_len.value])
+            if ec_sig_bytes is not None and len(signature) != ec_sig_bytes:
+                raise HostError("unexpected ECDSA signature length")
+            return cert_der, web_alg, signature
+        finally:
+            if caller_free.value and hkey.value:
+                self._ncrypt.NCryptFreeObject(hkey)
+            for cert_ctx, *_ in candidates:
+                self._crypt32.CertFreeCertificateContext(cert_ctx)
+            self._crypt32.CertCloseStore(store, 0)
+
+
+# ---- POSIX PKCS#11 backend (FreeBSD / Linux / macOS) ----
 
 
 def read_pin_file_posix(pin_file: str) -> bytearray:
@@ -475,7 +1052,7 @@ def read_pin_file_posix(pin_file: str) -> bytearray:
 
 
 def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
-    """Prompt the cardholder for PIN1 in a topmost masked GUI dialog."""
+    """Prompt the cardholder for PIN1 in a topmost masked GUI dialog (POSIX)."""
     try:
         import tkinter as tk
     except ImportError as exc:
@@ -548,27 +1125,13 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
 
 
 def obtain_pin(origin: str, token_flags: int) -> bytearray | None:
-    """Obtain PIN1 bytes, or None when the token uses a protected auth path."""
+    """Obtain PIN1 bytes on POSIX, or None for a protected authentication path."""
     if token_flags & CKF_PROTECTED_AUTHENTICATION_PATH:
         return None
     pin_file = os.environ.get(ENV_PIN_FILE)
     if pin_file and not IS_WINDOWS:
         return read_pin_file_posix(pin_file)
     return prompt_pin_dialog(origin, token_flags)
-
-
-def compute_web_eid_tbs_hash(origin: str, challenge: str) -> bytes:
-    """Compute the 48-byte SHA-384 digest signed by ES384 for Web eID.
-
-    Web eID specifies ES384 over SHA-384(origin) || SHA-384(challenge).
-    PKCS#11 CKM_ECDSA takes the pre-computed digest, so we hash the 96-byte
-    concatenation with SHA-384 before handing 48 bytes to the token.
-    """
-    payload = (
-        hashlib.sha384(origin.encode("utf-8")).digest()
-        + hashlib.sha384(challenge.encode("utf-8")).digest()
-    )
-    return hashlib.sha384(payload).digest()
 
 
 def _make_ulong_attr(attr_type: int, value: int) -> tuple[CkAttribute, CkUlong]:
@@ -604,7 +1167,7 @@ def _make_bytes_attr(
 
 
 class Pkcs11Provider:
-    """Minimal PKCS#11 v2.40 client speaking directly to RefineID's module."""
+    """Minimal PKCS#11 v2.40 client speaking directly to RefineID's module (POSIX)."""
 
     def __init__(self, module_path: str) -> None:
         try:
@@ -763,7 +1326,7 @@ class Pkcs11Provider:
         if rv != CKR_OK:
             raise HostError("authentication signature failed")
         signature = bytes(sig_buf[: sig_len.value])
-        if len(signature) != EC_SIGNATURE_BYTES:
+        if len(signature) != EC_P384_SIG_BYTES:
             raise HostError("unexpected ECDSA signature length")
         return signature
 
@@ -783,6 +1346,7 @@ class Pkcs11Provider:
                 raise HostError("failed to open PKCS#11 session")
             cert_der, _cert_id, key_type = self._find_auth_cert(session)
             return {
+                "backend": "pkcs11",
                 "model": model,
                 "certBytes": len(cert_der),
                 "isEc": key_type == CKK_EC,
@@ -845,17 +1409,22 @@ class Pkcs11Provider:
 
 def authenticate(
     arguments: Any,
-    provider_factory: Callable[[str], Any] = Pkcs11Provider,
+    *,
+    cng_factory: Callable[[], Any] | None = None,
+    pkcs11_factory: Callable[[str], Any] = Pkcs11Provider,
     pin_getter: Callable[[str, int], bytearray | None] = obtain_pin,
     config: dict[str, Any] | None = None,
+    use_windows_cng: bool = IS_WINDOWS,
 ) -> dict[str, Any]:
     """Validate a Web eID authenticate command and return the signed token."""
     if not isinstance(arguments, dict):
-        raise HostError("authenticate arguments are missing", code=ERROR_CODE_INVALID_ARGUMENT)
+        raise HostError(
+            "authenticate arguments are missing", code=ERROR_CODE_INVALID_ARGUMENT
+        )
 
     cfg = load_config() if config is None else config
     allowlist = resolve_allowed_origins(cfg)
-    if allowlist is None and not IS_WINDOWS and os.environ.get(ENV_PIN_FILE):
+    if allowlist is None and not use_windows_cng and os.environ.get(ENV_PIN_FILE):
         allowlist = DEFAULT_HEADLESS_ORIGINS
 
     origin = validate_https_origin(arguments.get("origin"), allowlist=allowlist)
@@ -863,17 +1432,22 @@ def authenticate(
     if not isinstance(challenge, str) or len(challenge) < MIN_CHALLENGE_LENGTH:
         raise HostError("challenge nonce is missing", code=ERROR_CODE_INVALID_ARGUMENT)
 
-    module_path = resolve_pkcs11_path(cfg)
-    model = resolve_model(cfg)
-    tbs_hash = compute_web_eid_tbs_hash(origin, challenge)
+    if use_windows_cng:
+        provider = (cng_factory or WindowsCngProvider)()
+        cert_der, algorithm, signature = provider.authenticate(origin, challenge)
+    else:
+        module_path = resolve_pkcs11_path(cfg)
+        model = resolve_model(cfg)
+        tbs_hash = compute_web_eid_tbs_hash(origin, challenge)
+        provider = pkcs11_factory(module_path)
+        cert_der, signature = provider.sign_authentication(
+            model, origin, tbs_hash, pin_getter
+        )
+        algorithm = ALGORITHM_ES384
 
-    provider = provider_factory(module_path)
-    cert_der, signature = provider.sign_authentication(
-        model, origin, tbs_hash, pin_getter
-    )
     return {
         "unverifiedCertificate": base64.b64encode(cert_der).decode("ascii"),
-        "algorithm": ALGORITHM_ES384,
+        "algorithm": algorithm,
         "signature": base64.b64encode(signature).decode("ascii"),
         "format": TOKEN_FORMAT,
         "appVersion": APP_VERSION,
@@ -882,9 +1456,12 @@ def authenticate(
 
 def handle_command(
     message: dict[str, Any],
-    provider_factory: Callable[[str], Any] = Pkcs11Provider,
+    *,
+    cng_factory: Callable[[], Any] | None = None,
+    pkcs11_factory: Callable[[str], Any] = Pkcs11Provider,
     pin_getter: Callable[[str, int], bytearray | None] = obtain_pin,
     config: dict[str, Any] | None = None,
+    use_windows_cng: bool = IS_WINDOWS,
 ) -> tuple[dict[str, Any], bool]:
     """Dispatch one decoded `eu.webeid` command. Returns (reply, should_exit)."""
     try:
@@ -895,9 +1472,11 @@ def handle_command(
             return (
                 authenticate(
                     message.get("arguments"),
-                    provider_factory=provider_factory,
+                    cng_factory=cng_factory,
+                    pkcs11_factory=pkcs11_factory,
                     pin_getter=pin_getter,
                     config=config,
+                    use_windows_cng=use_windows_cng,
                 ),
                 False,
             )
@@ -907,12 +1486,15 @@ def handle_command(
 
 
 def run_probe() -> int:
-    """CLI self-check: verify module load and card detection without PII."""
+    """CLI self-check: verify smart card auth detection without PIN or PII."""
     try:
-        cfg = load_config()
-        module_path = resolve_pkcs11_path(cfg)
-        model = resolve_model(cfg)
-        info = Pkcs11Provider(module_path).probe(model)
+        if IS_WINDOWS:
+            info = WindowsCngProvider().probe()
+        else:
+            cfg = load_config()
+            module_path = resolve_pkcs11_path(cfg)
+            model = resolve_model(cfg)
+            info = Pkcs11Provider(module_path).probe(model)
     except HostError as error:
         print(json.dumps({"ok": False, "code": error.code, "message": str(error)}))
         return 1
