@@ -24,11 +24,11 @@ import install  # noqa: E402
 
 SYNTHETIC_CHALLENGE = "A" * 44
 SYNTHETIC_CERT_DER = b"\x30\x82\x01\x00" + (b"\x11" * 16)
-SYNTHETIC_SIGNATURE = bytes(range(host.EC_SIGNATURE_BYTES))
+SYNTHETIC_SIGNATURE = bytes(range(host.EC_P384_SIG_BYTES))
 SYNTHETIC_PIN = b"1234"
 
 
-class FakeProvider:
+class FakePkcs11Provider:
     def __init__(
         self,
         *,
@@ -56,6 +56,28 @@ class FakeProvider:
         pin = pin_getter(origin, self.flags)
         host.zero_bytearray(pin)
         return self.cert_der, self.signature
+
+
+class FakeCngProvider:
+    def __init__(
+        self,
+        *,
+        cert_der: bytes = SYNTHETIC_CERT_DER,
+        algorithm: str = host.ALGORITHM_ES384,
+        signature: bytes = SYNTHETIC_SIGNATURE,
+        error: host.HostError | None = None,
+    ) -> None:
+        self.cert_der = cert_der
+        self.algorithm = algorithm
+        self.signature = signature
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    def authenticate(self, origin: str, challenge: str) -> tuple[bytes, str, bytes]:
+        self.calls.append((origin, challenge))
+        if self.error is not None:
+            raise self.error
+        return self.cert_der, self.algorithm, self.signature
 
 
 class HostFramingTests(unittest.TestCase):
@@ -116,21 +138,85 @@ class HostProtocolTests(unittest.TestCase):
             "https://example.ee:8443",
         )
 
-    def test_rejects_short_challenge(self) -> None:
+    def test_select_web_eid_algorithm_handles_ecdh_ecdsa_and_rsa(self) -> None:
+        self.assertEqual(
+            host.select_web_eid_algorithm("ECDH_P384", 384),
+            ("ES384", "sha384", 96),
+        )
+        self.assertEqual(
+            host.select_web_eid_algorithm("ECDSA_P384", 384),
+            ("ES384", "sha384", 96),
+        )
+        self.assertEqual(
+            host.select_web_eid_algorithm("ECDSA_P256", 256),
+            ("ES256", "sha256", 64),
+        )
+        self.assertEqual(
+            host.select_web_eid_algorithm("RSA", 3072),
+            ("RS256", "sha256", None),
+        )
+        with self.assertRaises(host.HostError):
+            host.select_web_eid_algorithm("DSA", 1024)
+
+    def test_classify_windows_cng_status_maps_cancel_and_lock(self) -> None:
+        for cancelled in (
+            host.WIN_NTE_USER_CANCELLED,
+            host.WIN_SCARD_W_CANCELLED_BY_USER,
+            host.WIN_HRESULT_ERROR_CANCELLED,
+            host.WIN_NTE_USER_CANCELLED - (1 << 32),
+        ):
+            err = host.classify_windows_cng_status(cancelled)
+            self.assertEqual(err.code, host.ERROR_CODE_USER_CANCELLED)
+        locked = host.classify_windows_cng_status(host.WIN_SCARD_W_CHV_BLOCKED)
+        self.assertEqual(locked.code, host.ERROR_CODE_FATAL)
+        self.assertIn("locked", str(locked))
+
+    def test_windows_cng_path_returns_web_eid_token(self) -> None:
+        fake = FakeCngProvider()
+        reply, should_exit = host.handle_command(
+            {
+                "command": "authenticate",
+                "arguments": {
+                    "origin": "https://tara.ria.ee",
+                    "challengeNonce": SYNTHETIC_CHALLENGE,
+                },
+            },
+            cng_factory=lambda: fake,
+            config={},
+            use_windows_cng=True,
+        )
+        self.assertFalse(should_exit)
+        self.assertNotIn("error", reply)
+        self.assertEqual(reply["algorithm"], "ES384")
+        self.assertEqual(reply["format"], "web-eid:1.0")
+        self.assertEqual(
+            base64.b64decode(reply["unverifiedCertificate"]), SYNTHETIC_CERT_DER
+        )
+        self.assertEqual(base64.b64decode(reply["signature"]), SYNTHETIC_SIGNATURE)
+        self.assertEqual(fake.calls, [("https://tara.ria.ee", SYNTHETIC_CHALLENGE)])
+
+    def test_windows_cng_cancel_propagates_user_cancelled(self) -> None:
+        fake = FakeCngProvider(
+            error=host.HostError(
+                "PIN entry cancelled", code=host.ERROR_CODE_USER_CANCELLED
+            )
+        )
         reply, _ = host.handle_command(
             {
                 "command": "authenticate",
                 "arguments": {
                     "origin": "https://tara.ria.ee",
-                    "challengeNonce": "short",
+                    "challengeNonce": SYNTHETIC_CHALLENGE,
                 },
             },
-            config={"pkcs11_module": "/nonexistent"},
+            cng_factory=lambda: fake,
+            config={},
+            use_windows_cng=True,
         )
-        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_INVALID_ARGUMENT)
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_USER_CANCELLED)
 
-    def test_produces_expected_web_eid_token_and_digest(self) -> None:
-        fake = FakeProvider()
+    def test_posix_pkcs11_path_produces_expected_web_eid_token_and_digest(self) -> None:
+        fake = FakePkcs11Provider()
         captured_pin_buf: list[bytearray] = []
 
         def fake_pin_getter(_origin: str, _flags: int) -> bytearray:
@@ -147,9 +233,10 @@ class HostProtocolTests(unittest.TestCase):
                     "lang": "en",
                 },
             },
-            provider_factory=lambda _path: fake,
+            pkcs11_factory=lambda _path: fake,
             pin_getter=fake_pin_getter,
             config={"pkcs11_module": "/fake/pkcs11.so", "model": "ESTeID"},
+            use_windows_cng=False,
         )
 
         self.assertFalse(should_exit)
@@ -182,34 +269,10 @@ class HostProtocolTests(unittest.TestCase):
                     "challengeNonce": SYNTHETIC_CHALLENGE,
                 },
             },
-            config={
-                "pkcs11_module": "/fake/pkcs11.so",
-                "allowed_origins": ["https://tara.ria.ee"],
-            },
+            config={"allowed_origins": ["https://tara.ria.ee"]},
+            use_windows_cng=True,
         )
         self.assertEqual(reply["error"]["code"], host.ERROR_CODE_INVALID_ARGUMENT)
-
-    def test_user_cancelled_preserves_error_code(self) -> None:
-        fake = FakeProvider()
-
-        def cancelling_pin_getter(_origin: str, _flags: int) -> bytearray:
-            raise host.HostError(
-                "PIN entry cancelled", code=host.ERROR_CODE_USER_CANCELLED
-            )
-
-        reply, _ = host.handle_command(
-            {
-                "command": "authenticate",
-                "arguments": {
-                    "origin": "https://tara.ria.ee",
-                    "challengeNonce": SYNTHETIC_CHALLENGE,
-                },
-            },
-            provider_factory=lambda _path: fake,
-            pin_getter=cancelling_pin_getter,
-            config={"pkcs11_module": "/fake/pkcs11.so"},
-        )
-        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_USER_CANCELLED)
 
     def test_protected_path_skips_pin_prompt(self) -> None:
         self.assertIsNone(
@@ -235,7 +298,6 @@ class HostProtocolTests(unittest.TestCase):
                 host.zero_bytearray(pin)
 
     def test_function_list_field_count_matches_pkcs11_v240(self) -> None:
-        # CK_VERSION + 68 function pointers defined in PKCS#11 v2.40 pkcs11f.h.
         self.assertEqual(len(host.CkFunctionList._fields_), 69)
         if host.IS_WINDOWS:
             expected_size = 2 + 68 * ctypes.sizeof(ctypes.c_void_p)
@@ -243,23 +305,22 @@ class HostProtocolTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
-    def test_install_windows_eu_webeid_layout(self) -> None:
+    def test_install_windows_cng_layout_requires_no_pkcs11(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            fake_dll = tmp_path / "refineid_pkcs11.dll"
-            fake_dll.write_bytes(b"MZ")
-            dest = tmp_path / "out"
+            dest = Path(tmp) / "out"
 
-            install.install(
+            summary = install.install(
                 source_dir=HERE,
                 dest=dest,
-                pkcs11_module=fake_dll,
+                pkcs11_module=None,
                 model="ESTeID",
                 register=False,
                 python_executable=r"C:\Python315\python.exe",
                 windows=True,
             )
 
+            self.assertEqual(summary["backend"], "windows-cng")
+            self.assertIsNone(summary["pkcs11_module"])
             self.assertTrue((dest / "host.py").is_file())
             cmd_bytes = (dest / "host.cmd").read_bytes()
             self.assertNotIn(b"\r\r\n", cmd_bytes)
@@ -269,8 +330,7 @@ class InstallerTests(unittest.TestCase):
             )
 
             config = json.loads((dest / "config.json").read_text(encoding="utf-8"))
-            self.assertEqual(config["pkcs11_module"], str(fake_dll))
-            self.assertEqual(config["model"], "ESTeID")
+            self.assertEqual(config, {"backend": "windows-cng"})
 
             chromium = json.loads(
                 (dest / "eu.webeid.chromium.json").read_text(encoding="utf-8")
@@ -296,16 +356,13 @@ class InstallerTests(unittest.TestCase):
 
     def test_install_windows_layout_with_non_ascii_python_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            fake_dll = tmp_path / "refineid_pkcs11.dll"
-            fake_dll.write_bytes(b"MZ")
-            dest = tmp_path / "out"
+            dest = Path(tmp) / "out"
             py_path = r"C:\Users\Jürgen\Python315\python.exe"
 
             install.install(
                 source_dir=HERE,
                 dest=dest,
-                pkcs11_module=fake_dll,
+                pkcs11_module=None,
                 model="ESTeID",
                 register=False,
                 python_executable=py_path,
@@ -321,7 +378,7 @@ class InstallerTests(unittest.TestCase):
             fake_so.write_bytes(b"\x7fELF")
             dest = tmp_path / "out"
 
-            install.install(
+            summary = install.install(
                 source_dir=HERE,
                 dest=dest,
                 pkcs11_module=fake_so,
@@ -330,6 +387,7 @@ class InstallerTests(unittest.TestCase):
                 python_executable="/usr/bin/python3",
                 windows=False,
             )
+            self.assertEqual(summary["backend"], "pkcs11")
             self.assertTrue((dest / "host.sh").is_file())
             self.assertTrue(os.access(dest / "host.sh", os.X_OK))
             self.assertTrue((dest / "eu.webeid.firefox.json").is_file())
