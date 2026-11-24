@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Native messaging host answering Web eID authentication requests.
+"""Official Web eID (`eu.webeid`) native messaging host backed by RefineID PKCS#11.
 
-Speaks PKCS#11 v2.40 directly to the RefineID PKCS#11 module via ctypes so
-the same host runs on Windows, FreeBSD, Linux and macOS without OpenSSL or
-pkcs11-provider. Builds the Web eID authentication token:
-SHA-384(origin) concatenated with SHA-384(challenge), hashed with SHA-384
-and signed with CKM_ECDSA by the card's authentication key.
+Implements the native messaging protocol spoken by the official store-signed
+Web eID browser extension (`web-eid-webextension` 2.x) for Microsoft Edge,
+Google Chrome and Mozilla Firefox:
+
+1. Immediately writes `{"version": "2.5.0"}` on startup.
+2. Handles `{"command": "quit", "arguments": {}}` by replying `{}` and exiting.
+3. Handles `{"command": "authenticate", "arguments": {"challengeNonce", "origin"}}`
+   by loading the RefineID PKCS#11 module directly via ctypes, selecting the
+   ESTeID token, prompting for PIN1 in a topmost local dialog showing the exact
+   origin, computing SHA-384(SHA-384(origin) || SHA-384(challengeNonce)),
+   signing with CKM_ECDSA, and returning the Web eID 1.0 authentication token.
 
 The PIN stays on the machine in a zeroed bytearray; the host never logs,
 prints or returns it, nor any cardholder data or challenge.
@@ -23,6 +29,7 @@ import struct
 import sys
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 # ---- Web eID protocol constants ----
 
@@ -31,25 +38,29 @@ SHA384_DIGEST_BYTES = 48
 MIN_CHALLENGE_LENGTH = 32
 ALGORITHM_ES384 = "ES384"
 TOKEN_FORMAT = "web-eid:1.0"
-APP_VERSION = "refineid/2.0.0"
-EXTENSION_VERSION = "2.0.0"
+NATIVE_VERSION = "2.5.0"
+APP_VERSION = f"https://refineid.fi/webeid/v{NATIVE_VERSION}"
 ERROR_CODE_FATAL = "ERR_WEBEID_NATIVE_FATAL"
+ERROR_CODE_INVALID_ARGUMENT = "ERR_WEBEID_NATIVE_INVALID_ARGUMENT"
 ERROR_CODE_USER_CANCELLED = "ERR_WEBEID_USER_CANCELLED"
-MAX_MESSAGE_BYTES = 1 << 20
+MAX_MESSAGE_BYTES = 8192
 MESSAGE_HEADER_BYTES = 4
 MESSAGE_HEADER_FORMAT = "=I"
 
 DEFAULT_MODEL = "ESTeID"
-ALLOWED_ORIGINS = frozenset({"https://tara.ria.ee"})
+DEFAULT_HEADLESS_ORIGINS = frozenset({"https://tara.ria.ee"})
 CONFIG_FILENAME = "config.json"
 
 ENV_PKCS11_MODULE = "REFINEID_WEBEID_PKCS11"
 ENV_MODEL = "REFINEID_WEBEID_MODEL"
 ENV_PIN_FILE = "REFINEID_WEBEID_PIN_FILE"
+ENV_ALLOWED_ORIGINS = "REFINEID_WEBEID_ALLOWED_ORIGINS"
 POSIX_GROUP_OTHER_MASK = 0o077
 ASCII_LF = 0x0A
 ASCII_CR = 0x0D
 NEWLINE_BYTES = (ASCII_LF, ASCII_CR)
+ASCII_PRINTABLE_MIN = 0x21
+ASCII_PRINTABLE_MAX = 0x7E
 
 # ---- PKCS#11 v2.40 constants (OASIS pkcs11t.h) ----
 
@@ -337,6 +348,53 @@ def resolve_model(config: dict[str, Any]) -> str:
     return DEFAULT_MODEL
 
 
+def resolve_allowed_origins(config: dict[str, Any]) -> frozenset[str] | None:
+    """Resolve an optional origin allowlist; None permits any canonical HTTPS origin."""
+    env_value = os.environ.get(ENV_ALLOWED_ORIGINS)
+    if env_value is not None:
+        entries = [item.strip() for item in env_value.split(",") if item.strip()]
+        return frozenset(entries)
+    cfg_value = config.get("allowed_origins")
+    if isinstance(cfg_value, list):
+        return frozenset(
+            item.strip()
+            for item in cfg_value
+            if isinstance(item, str) and item.strip()
+        )
+    return None
+
+
+def validate_https_origin(origin: Any, allowlist: frozenset[str] | None = None) -> str:
+    """Require a canonical HTTPS origin (no path, query, fragment or userinfo)."""
+    if not isinstance(origin, str) or not origin:
+        raise HostError("origin is missing", code=ERROR_CODE_INVALID_ARGUMENT)
+    if any(
+        ord(ch) < ASCII_PRINTABLE_MIN or ord(ch) > ASCII_PRINTABLE_MAX
+        for ch in origin
+    ):
+        raise HostError("origin is invalid", code=ERROR_CODE_INVALID_ARGUMENT)
+    parsed = urlsplit(origin)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HostError("origin must be an HTTPS origin", code=ERROR_CODE_INVALID_ARGUMENT)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise HostError("origin port is invalid", code=ERROR_CODE_INVALID_ARGUMENT) from exc
+    if origin != f"https://{parsed.netloc}":
+        raise HostError("origin is not canonical", code=ERROR_CODE_INVALID_ARGUMENT)
+    if allowlist is not None and origin not in allowlist:
+        raise HostError("origin is not allowed", code=ERROR_CODE_INVALID_ARGUMENT)
+    return origin
+
+
 def read_message(stream: Any = None) -> dict[str, Any] | None:
     """Read one length-prefixed JSON message from the browser pipe."""
     buf = sys.stdin.buffer if stream is None else stream
@@ -433,7 +491,7 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
     frame = tk.Frame(root, padx=18, pady=14)
     frame.pack(fill="both", expand=True)
 
-    prompt_text = f"Enter ID-card PIN1 to log in to\n{origin}"
+    prompt_text = f"Enter ID-card PIN1 to authenticate to:\n{origin}"
     if token_flags & CKF_USER_PIN_FINAL_TRY:
         prompt_text += "\n\nWarning: final attempt before PIN1 locks."
     elif token_flags & CKF_USER_PIN_COUNT_LOW:
@@ -441,7 +499,7 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
 
     tk.Label(frame, text=prompt_text, justify="left").pack(anchor="w")
 
-    entry = tk.Entry(frame, show="*", width=24)
+    entry = tk.Entry(frame, show="*", width=26)
     entry.pack(fill="x", pady=(10, 12))
 
     buttons = tk.Frame(frame)
@@ -463,7 +521,9 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
     tk.Button(buttons, text="Cancel", width=10, command=on_cancel).pack(
         side="right", padx=(8, 0)
     )
-    tk.Button(buttons, text="OK", width=10, command=on_submit).pack(side="right")
+    tk.Button(buttons, text="Authenticate", width=12, command=on_submit).pack(
+        side="right"
+    )
 
     root.protocol("WM_DELETE_WINDOW", on_cancel)
     root.bind("<Return>", on_submit)
@@ -531,7 +591,9 @@ def _make_bool_attr(attr_type: int, value: int) -> tuple[CkAttribute, CkBbool]:
     return attr, storage
 
 
-def _make_bytes_attr(attr_type: int, value: bytes) -> tuple[CkAttribute, ctypes.Array[Any]]:
+def _make_bytes_attr(
+    attr_type: int, value: bytes
+) -> tuple[CkAttribute, ctypes.Array[Any]]:
     storage = (CkByte * len(value))(*value)
     attr = CkAttribute(
         type=attr_type,
@@ -782,20 +844,25 @@ class Pkcs11Provider:
 
 
 def authenticate(
-    message: dict[str, Any],
+    arguments: Any,
     provider_factory: Callable[[str], Any] = Pkcs11Provider,
     pin_getter: Callable[[str, int], bytearray | None] = obtain_pin,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate a Web eID authenticate request and return the signed token."""
-    origin = message.get("origin")
-    challenge = message.get("challengeNonce")
-    if not isinstance(origin, str) or origin not in ALLOWED_ORIGINS:
-        raise HostError("origin is not allowed")
-    if not isinstance(challenge, str) or len(challenge) < MIN_CHALLENGE_LENGTH:
-        raise HostError("challenge nonce is missing")
+    """Validate a Web eID authenticate command and return the signed token."""
+    if not isinstance(arguments, dict):
+        raise HostError("authenticate arguments are missing", code=ERROR_CODE_INVALID_ARGUMENT)
 
     cfg = load_config() if config is None else config
+    allowlist = resolve_allowed_origins(cfg)
+    if allowlist is None and not IS_WINDOWS and os.environ.get(ENV_PIN_FILE):
+        allowlist = DEFAULT_HEADLESS_ORIGINS
+
+    origin = validate_https_origin(arguments.get("origin"), allowlist=allowlist)
+    challenge = arguments.get("challengeNonce")
+    if not isinstance(challenge, str) or len(challenge) < MIN_CHALLENGE_LENGTH:
+        raise HostError("challenge nonce is missing", code=ERROR_CODE_INVALID_ARGUMENT)
+
     module_path = resolve_pkcs11_path(cfg)
     model = resolve_model(cfg)
     tbs_hash = compute_web_eid_tbs_hash(origin, challenge)
@@ -813,32 +880,30 @@ def authenticate(
     }
 
 
-def status() -> dict[str, str]:
-    """Return extension and native host version strings for Web eID status."""
-    return {"extension": EXTENSION_VERSION, "nativeApp": APP_VERSION}
-
-
-def handle_request(
+def handle_command(
     message: dict[str, Any],
     provider_factory: Callable[[str], Any] = Pkcs11Provider,
     pin_getter: Callable[[str, int], bytearray | None] = obtain_pin,
     config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Dispatch one decoded native-messaging request."""
+) -> tuple[dict[str, Any], bool]:
+    """Dispatch one decoded `eu.webeid` command. Returns (reply, should_exit)."""
     try:
-        action = message.get("action")
-        if action == "authenticate":
-            return authenticate(
-                message,
-                provider_factory=provider_factory,
-                pin_getter=pin_getter,
-                config=config,
+        command = message.get("command")
+        if command == "quit":
+            return {}, True
+        if command == "authenticate":
+            return (
+                authenticate(
+                    message.get("arguments"),
+                    provider_factory=provider_factory,
+                    pin_getter=pin_getter,
+                    config=config,
+                ),
+                False,
             )
-        if action == "status":
-            return status()
-        raise HostError("unknown action")
+        raise HostError("unsupported command", code=ERROR_CODE_INVALID_ARGUMENT)
     except HostError as error:
-        return {"error": {"code": error.code, "message": str(error)}}
+        return {"error": {"code": error.code, "message": str(error)}}, False
 
 
 def run_probe() -> int:
@@ -861,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_probe()
 
     configure_binary_stdio()
+    write_message({"version": NATIVE_VERSION})
     while True:
         try:
             message = read_message()
@@ -869,7 +935,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if message is None:
             return 0
-        write_message(handle_request(message))
+        reply, should_exit = handle_command(message)
+        write_message(reply)
+        if should_exit:
+            return 0
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic unit tests for host.py and install.py."""
+"""Hermetic unit tests for the eu.webeid native host and installer."""
 
 from __future__ import annotations
 
@@ -61,9 +61,11 @@ class FakeProvider:
 class HostFramingTests(unittest.TestCase):
     def test_round_trip_message(self) -> None:
         buf = io.BytesIO()
-        host.write_message({"action": "status"}, stream=buf)
+        host.write_message({"command": "quit", "arguments": {}}, stream=buf)
         buf.seek(0)
-        self.assertEqual(host.read_message(stream=buf), {"action": "status"})
+        self.assertEqual(
+            host.read_message(stream=buf), {"command": "quit", "arguments": {}}
+        )
 
     def test_eof_returns_none(self) -> None:
         self.assertIsNone(host.read_message(stream=io.BytesIO(b"")))
@@ -79,36 +81,53 @@ class HostFramingTests(unittest.TestCase):
             host.read_message(stream=io.BytesIO(raw))
 
 
-class HostAuthTests(unittest.TestCase):
-    def test_status_action(self) -> None:
-        reply = host.handle_request({"action": "status"})
-        self.assertEqual(
-            reply,
-            {"extension": host.EXTENSION_VERSION, "nativeApp": host.APP_VERSION},
-        )
+class HostProtocolTests(unittest.TestCase):
+    def test_quit_command_replies_empty_object_and_exits(self) -> None:
+        reply, should_exit = host.handle_command({"command": "quit", "arguments": {}})
+        self.assertEqual(reply, {})
+        self.assertTrue(should_exit)
 
-    def test_rejects_disallowed_origin(self) -> None:
-        reply = host.handle_request(
-            {
-                "action": "authenticate",
-                "origin": "https://evil.example",
-                "challengeNonce": SYNTHETIC_CHALLENGE,
-            },
-            config={"pkcs11_module": "/nonexistent"},
+    def test_unknown_command_returns_invalid_argument(self) -> None:
+        reply, should_exit = host.handle_command({"command": "sign", "arguments": {}})
+        self.assertFalse(should_exit)
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_INVALID_ARGUMENT)
+
+    def test_rejects_non_https_and_non_canonical_origins(self) -> None:
+        for bad_origin in (
+            "http://tara.ria.ee",
+            "https://tara.ria.ee/path",
+            "https://tara.ria.ee?q=1",
+            "https://user@tara.ria.ee",
+            "https://tara.ria.ee/",
+            "https://tara.ria.ee\n",
+            "",
+        ):
+            with self.assertRaises(host.HostError) as ctx:
+                host.validate_https_origin(bad_origin)
+            self.assertEqual(ctx.exception.code, host.ERROR_CODE_INVALID_ARGUMENT)
+
+    def test_accepts_canonical_https_origin_and_port(self) -> None:
+        self.assertEqual(
+            host.validate_https_origin("https://tara.ria.ee"),
+            "https://tara.ria.ee",
         )
-        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_FATAL)
-        self.assertIn("origin", reply["error"]["message"])
+        self.assertEqual(
+            host.validate_https_origin("https://example.ee:8443"),
+            "https://example.ee:8443",
+        )
 
     def test_rejects_short_challenge(self) -> None:
-        reply = host.handle_request(
+        reply, _ = host.handle_command(
             {
-                "action": "authenticate",
-                "origin": "https://tara.ria.ee",
-                "challengeNonce": "short",
+                "command": "authenticate",
+                "arguments": {
+                    "origin": "https://tara.ria.ee",
+                    "challengeNonce": "short",
+                },
             },
             config={"pkcs11_module": "/nonexistent"},
         )
-        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_FATAL)
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_INVALID_ARGUMENT)
 
     def test_produces_expected_web_eid_token_and_digest(self) -> None:
         fake = FakeProvider()
@@ -119,20 +138,25 @@ class HostAuthTests(unittest.TestCase):
             captured_pin_buf.append(buf)
             return buf
 
-        reply = host.handle_request(
+        reply, should_exit = host.handle_command(
             {
-                "action": "authenticate",
-                "origin": "https://tara.ria.ee",
-                "challengeNonce": SYNTHETIC_CHALLENGE,
+                "command": "authenticate",
+                "arguments": {
+                    "origin": "https://tara.ria.ee",
+                    "challengeNonce": SYNTHETIC_CHALLENGE,
+                    "lang": "en",
+                },
             },
             provider_factory=lambda _path: fake,
             pin_getter=fake_pin_getter,
             config={"pkcs11_module": "/fake/pkcs11.so", "model": "ESTeID"},
         )
 
+        self.assertFalse(should_exit)
         self.assertNotIn("error", reply)
         self.assertEqual(reply["algorithm"], "ES384")
         self.assertEqual(reply["format"], "web-eid:1.0")
+        self.assertEqual(reply["appVersion"], host.APP_VERSION)
         self.assertEqual(
             base64.b64decode(reply["unverifiedCertificate"]), SYNTHETIC_CERT_DER
         )
@@ -144,20 +168,42 @@ class HostAuthTests(unittest.TestCase):
         )
         expected_hash = hashlib.sha384(expected_payload).digest()
         self.assertEqual(len(fake.calls), 1)
-        self.assertEqual(fake.calls[0], ("ESTeID", "https://tara.ria.ee", expected_hash))
+        self.assertEqual(
+            fake.calls[0], ("ESTeID", "https://tara.ria.ee", expected_hash)
+        )
         self.assertEqual(captured_pin_buf[0], bytearray(len(SYNTHETIC_PIN)))
+
+    def test_optional_origin_allowlist_enforced(self) -> None:
+        reply, _ = host.handle_command(
+            {
+                "command": "authenticate",
+                "arguments": {
+                    "origin": "https://other.example",
+                    "challengeNonce": SYNTHETIC_CHALLENGE,
+                },
+            },
+            config={
+                "pkcs11_module": "/fake/pkcs11.so",
+                "allowed_origins": ["https://tara.ria.ee"],
+            },
+        )
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_INVALID_ARGUMENT)
 
     def test_user_cancelled_preserves_error_code(self) -> None:
         fake = FakeProvider()
 
         def cancelling_pin_getter(_origin: str, _flags: int) -> bytearray:
-            raise host.HostError("PIN entry cancelled", code=host.ERROR_CODE_USER_CANCELLED)
+            raise host.HostError(
+                "PIN entry cancelled", code=host.ERROR_CODE_USER_CANCELLED
+            )
 
-        reply = host.handle_request(
+        reply, _ = host.handle_command(
             {
-                "action": "authenticate",
-                "origin": "https://tara.ria.ee",
-                "challengeNonce": SYNTHETIC_CHALLENGE,
+                "command": "authenticate",
+                "arguments": {
+                    "origin": "https://tara.ria.ee",
+                    "challengeNonce": SYNTHETIC_CHALLENGE,
+                },
             },
             provider_factory=lambda _path: fake,
             pin_getter=cancelling_pin_getter,
@@ -167,7 +213,9 @@ class HostAuthTests(unittest.TestCase):
 
     def test_protected_path_skips_pin_prompt(self) -> None:
         self.assertIsNone(
-            host.obtain_pin("https://tara.ria.ee", host.CKF_PROTECTED_AUTHENTICATION_PATH)
+            host.obtain_pin(
+                "https://tara.ria.ee", host.CKF_PROTECTED_AUTHENTICATION_PATH
+            )
         )
 
     @unittest.skipIf(host.IS_WINDOWS, "POSIX mode-600 test")
@@ -195,21 +243,14 @@ class HostAuthTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
-    def test_chromium_extension_id_deterministic_and_valid(self) -> None:
-        key_der = install.build_edge_public_key_der()
-        ext_id = install.chromium_extension_id(key_der)
-        self.assertEqual(len(ext_id), 32)
-        self.assertTrue(all("a" <= ch <= "p" for ch in ext_id))
-        self.assertEqual(ext_id, install.chromium_extension_id(key_der))
-
-    def test_install_windows_layout_without_registry(self) -> None:
+    def test_install_windows_eu_webeid_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             fake_dll = tmp_path / "refineid_pkcs11.dll"
             fake_dll.write_bytes(b"MZ")
             dest = tmp_path / "out"
 
-            summary = install.install(
+            install.install(
                 source_dir=HERE,
                 dest=dest,
                 pkcs11_module=fake_dll,
@@ -220,73 +261,38 @@ class InstallerTests(unittest.TestCase):
             )
 
             self.assertTrue((dest / "host.py").is_file())
-            self.assertTrue((dest / "host.cmd").is_file())
             cmd_bytes = (dest / "host.cmd").read_bytes()
             self.assertNotIn(b"\r\r\n", cmd_bytes)
-            cmd_text = cmd_bytes.decode("ascii")
-            self.assertIn(r'"C:\Python315\python.exe" -B "%~dp0host.py"', cmd_text)
+            self.assertIn(
+                r'"C:\Python315\python.exe" -B "%~dp0host.py"',
+                cmd_bytes.decode("ascii"),
+            )
 
             config = json.loads((dest / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(config["pkcs11_module"], str(fake_dll))
             self.assertEqual(config["model"], "ESTeID")
 
-            edge_manifest = json.loads(
-                (dest / "ext-edge" / "manifest.json").read_text(encoding="utf-8")
+            chromium = json.loads(
+                (dest / "eu.webeid.chromium.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(edge_manifest["manifest_version"], 3)
+            self.assertEqual(chromium["name"], "eu.webeid")
+            self.assertEqual(chromium["path"], str(dest / "host.cmd"))
+            self.assertIn(
+                f"chrome-extension://{install.EDGE_EXTENSION_ID}/",
+                chromium["allowed_origins"],
+            )
+            self.assertIn(
+                f"chrome-extension://{install.CHROME_EXTENSION_ID}/",
+                chromium["allowed_origins"],
+            )
+
+            firefox = json.loads(
+                (dest / "eu.webeid.firefox.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(firefox["name"], "eu.webeid")
             self.assertEqual(
-                edge_manifest["background"]["service_worker"], "background.js"
+                firefox["allowed_extensions"], [install.FIREFOX_EXTENSION_ID]
             )
-            key_der = base64.b64decode(edge_manifest["key"])
-            derived_id = install.chromium_extension_id(key_der)
-            self.assertEqual(derived_id, summary["edge_extension_id"])
-
-            edge_native = json.loads(
-                (dest / "refineid_webeid_edge.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                edge_native["allowed_origins"],
-                [f"chrome-extension://{derived_id}/"],
-            )
-            self.assertEqual(edge_native["path"], str(dest / "host.cmd"))
-
-            firefox_manifest = json.loads(
-                (dest / "ext-firefox" / "manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(firefox_manifest["manifest_version"], 2)
-            self.assertEqual(
-                firefox_manifest["browser_specific_settings"]["gecko"]["id"],
-                install.FIREFOX_EXTENSION_ID,
-            )
-
-            firefox_native = json.loads(
-                (dest / "refineid_webeid_firefox.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                firefox_native["allowed_extensions"], [install.FIREFOX_EXTENSION_ID]
-            )
-
-    def test_install_posix_layout_without_registry(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            fake_so = tmp_path / "librefineid_pkcs11.so"
-            fake_so.write_bytes(b"\x7fELF")
-            dest = tmp_path / "out"
-
-            install.install(
-                source_dir=HERE,
-                dest=dest,
-                pkcs11_module=fake_so,
-                model="ESTeID",
-                register=False,
-                python_executable="/usr/bin/python3",
-                windows=False,
-            )
-            self.assertTrue((dest / "host.sh").is_file())
-            self.assertTrue(os.access(dest / "host.sh", os.X_OK))
-            self.assertTrue((dest / "ext-firefox" / "background.js").is_file())
-            self.assertTrue((dest / "ext-edge" / "content.js").is_file())
-
 
     def test_install_windows_layout_with_non_ascii_python_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,6 +313,27 @@ class InstallerTests(unittest.TestCase):
             )
             encoding = "mbcs" if install.IS_WINDOWS else "utf-8"
             self.assertIn(py_path, (dest / "host.cmd").read_text(encoding=encoding))
+
+    def test_install_posix_layout_without_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_so = tmp_path / "librefineid_pkcs11.so"
+            fake_so.write_bytes(b"\x7fELF")
+            dest = tmp_path / "out"
+
+            install.install(
+                source_dir=HERE,
+                dest=dest,
+                pkcs11_module=fake_so,
+                model="ESTeID",
+                register=False,
+                python_executable="/usr/bin/python3",
+                windows=False,
+            )
+            self.assertTrue((dest / "host.sh").is_file())
+            self.assertTrue(os.access(dest / "host.sh", os.X_OK))
+            self.assertTrue((dest / "eu.webeid.firefox.json").is_file())
+            self.assertTrue((dest / "eu.webeid.chromium.json").is_file())
 
 
 if __name__ == "__main__":
