@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Hermetic unit tests for host.py and install.py."""
+
+from __future__ import annotations
+
+import base64
+import ctypes
+import hashlib
+import io
+import json
+import os
+import stat
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import host  # noqa: E402
+import install  # noqa: E402
+
+SYNTHETIC_CHALLENGE = "A" * 44
+SYNTHETIC_CERT_DER = b"\x30\x82\x01\x00" + (b"\x11" * 16)
+SYNTHETIC_SIGNATURE = bytes(range(host.EC_SIGNATURE_BYTES))
+SYNTHETIC_PIN = b"1234"
+
+
+class FakeProvider:
+    def __init__(
+        self,
+        *,
+        cert_der: bytes = SYNTHETIC_CERT_DER,
+        signature: bytes = SYNTHETIC_SIGNATURE,
+        flags: int = 0,
+        error: host.HostError | None = None,
+    ) -> None:
+        self.cert_der = cert_der
+        self.signature = signature
+        self.flags = flags
+        self.error = error
+        self.calls: list[tuple[str, str, bytes]] = []
+
+    def sign_authentication(
+        self,
+        model: str,
+        origin: str,
+        tbs_hash: bytes,
+        pin_getter,
+    ) -> tuple[bytes, bytes]:
+        self.calls.append((model, origin, tbs_hash))
+        if self.error is not None:
+            raise self.error
+        pin = pin_getter(origin, self.flags)
+        host.zero_bytearray(pin)
+        return self.cert_der, self.signature
+
+
+class HostFramingTests(unittest.TestCase):
+    def test_round_trip_message(self) -> None:
+        buf = io.BytesIO()
+        host.write_message({"action": "status"}, stream=buf)
+        buf.seek(0)
+        self.assertEqual(host.read_message(stream=buf), {"action": "status"})
+
+    def test_eof_returns_none(self) -> None:
+        self.assertIsNone(host.read_message(stream=io.BytesIO(b"")))
+
+    def test_oversized_length_rejected(self) -> None:
+        raw = struct.pack("=I", host.MAX_MESSAGE_BYTES + 1)
+        with self.assertRaises(host.HostError):
+            host.read_message(stream=io.BytesIO(raw))
+
+    def test_zero_length_rejected(self) -> None:
+        raw = struct.pack("=I", 0)
+        with self.assertRaises(host.HostError):
+            host.read_message(stream=io.BytesIO(raw))
+
+
+class HostAuthTests(unittest.TestCase):
+    def test_status_action(self) -> None:
+        reply = host.handle_request({"action": "status"})
+        self.assertEqual(
+            reply,
+            {"extension": host.EXTENSION_VERSION, "nativeApp": host.APP_VERSION},
+        )
+
+    def test_rejects_disallowed_origin(self) -> None:
+        reply = host.handle_request(
+            {
+                "action": "authenticate",
+                "origin": "https://evil.example",
+                "challengeNonce": SYNTHETIC_CHALLENGE,
+            },
+            config={"pkcs11_module": "/nonexistent"},
+        )
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_FATAL)
+        self.assertIn("origin", reply["error"]["message"])
+
+    def test_rejects_short_challenge(self) -> None:
+        reply = host.handle_request(
+            {
+                "action": "authenticate",
+                "origin": "https://tara.ria.ee",
+                "challengeNonce": "short",
+            },
+            config={"pkcs11_module": "/nonexistent"},
+        )
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_FATAL)
+
+    def test_produces_expected_web_eid_token_and_digest(self) -> None:
+        fake = FakeProvider()
+        captured_pin_buf: list[bytearray] = []
+
+        def fake_pin_getter(_origin: str, _flags: int) -> bytearray:
+            buf = bytearray(SYNTHETIC_PIN)
+            captured_pin_buf.append(buf)
+            return buf
+
+        reply = host.handle_request(
+            {
+                "action": "authenticate",
+                "origin": "https://tara.ria.ee",
+                "challengeNonce": SYNTHETIC_CHALLENGE,
+            },
+            provider_factory=lambda _path: fake,
+            pin_getter=fake_pin_getter,
+            config={"pkcs11_module": "/fake/pkcs11.so", "model": "ESTeID"},
+        )
+
+        self.assertNotIn("error", reply)
+        self.assertEqual(reply["algorithm"], "ES384")
+        self.assertEqual(reply["format"], "web-eid:1.0")
+        self.assertEqual(
+            base64.b64decode(reply["unverifiedCertificate"]), SYNTHETIC_CERT_DER
+        )
+        self.assertEqual(base64.b64decode(reply["signature"]), SYNTHETIC_SIGNATURE)
+
+        expected_payload = (
+            hashlib.sha384(b"https://tara.ria.ee").digest()
+            + hashlib.sha384(SYNTHETIC_CHALLENGE.encode("utf-8")).digest()
+        )
+        expected_hash = hashlib.sha384(expected_payload).digest()
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0], ("ESTeID", "https://tara.ria.ee", expected_hash))
+        self.assertEqual(captured_pin_buf[0], bytearray(len(SYNTHETIC_PIN)))
+
+    def test_user_cancelled_preserves_error_code(self) -> None:
+        fake = FakeProvider()
+
+        def cancelling_pin_getter(_origin: str, _flags: int) -> bytearray:
+            raise host.HostError("PIN entry cancelled", code=host.ERROR_CODE_USER_CANCELLED)
+
+        reply = host.handle_request(
+            {
+                "action": "authenticate",
+                "origin": "https://tara.ria.ee",
+                "challengeNonce": SYNTHETIC_CHALLENGE,
+            },
+            provider_factory=lambda _path: fake,
+            pin_getter=cancelling_pin_getter,
+            config={"pkcs11_module": "/fake/pkcs11.so"},
+        )
+        self.assertEqual(reply["error"]["code"], host.ERROR_CODE_USER_CANCELLED)
+
+    def test_protected_path_skips_pin_prompt(self) -> None:
+        self.assertIsNone(
+            host.obtain_pin("https://tara.ria.ee", host.CKF_PROTECTED_AUTHENTICATION_PATH)
+        )
+
+    @unittest.skipIf(host.IS_WINDOWS, "POSIX mode-600 test")
+    def test_posix_pin_file_rejects_open_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pin_path = Path(tmp) / "pin.txt"
+            pin_path.write_bytes(SYNTHETIC_PIN + b"\n")
+            pin_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+            with self.assertRaises(host.HostError):
+                host.read_pin_file_posix(str(pin_path))
+
+            pin_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            pin = host.read_pin_file_posix(str(pin_path))
+            try:
+                self.assertEqual(bytes(pin), SYNTHETIC_PIN)
+            finally:
+                host.zero_bytearray(pin)
+
+    def test_function_list_field_count_matches_pkcs11_v240(self) -> None:
+        # CK_VERSION + 68 function pointers defined in PKCS#11 v2.40 pkcs11f.h.
+        self.assertEqual(len(host.CkFunctionList._fields_), 69)
+        if host.IS_WINDOWS:
+            expected_size = 2 + 68 * ctypes.sizeof(ctypes.c_void_p)
+            self.assertEqual(ctypes.sizeof(host.CkFunctionList), expected_size)
+
+
+class InstallerTests(unittest.TestCase):
+    def test_chromium_extension_id_deterministic_and_valid(self) -> None:
+        key_der = install.build_edge_public_key_der()
+        ext_id = install.chromium_extension_id(key_der)
+        self.assertEqual(len(ext_id), 32)
+        self.assertTrue(all("a" <= ch <= "p" for ch in ext_id))
+        self.assertEqual(ext_id, install.chromium_extension_id(key_der))
+
+    def test_install_windows_layout_without_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_dll = tmp_path / "refineid_pkcs11.dll"
+            fake_dll.write_bytes(b"MZ")
+            dest = tmp_path / "out"
+
+            summary = install.install(
+                source_dir=HERE,
+                dest=dest,
+                pkcs11_module=fake_dll,
+                model="ESTeID",
+                register=False,
+                python_executable=r"C:\Python315\python.exe",
+                windows=True,
+            )
+
+            self.assertTrue((dest / "host.py").is_file())
+            self.assertTrue((dest / "host.cmd").is_file())
+            cmd_bytes = (dest / "host.cmd").read_bytes()
+            self.assertNotIn(b"\r\r\n", cmd_bytes)
+            cmd_text = cmd_bytes.decode("ascii")
+            self.assertIn(r'"C:\Python315\python.exe" -B "%~dp0host.py"', cmd_text)
+
+            config = json.loads((dest / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["pkcs11_module"], str(fake_dll))
+            self.assertEqual(config["model"], "ESTeID")
+
+            edge_manifest = json.loads(
+                (dest / "ext-edge" / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(edge_manifest["manifest_version"], 3)
+            self.assertEqual(
+                edge_manifest["background"]["service_worker"], "background.js"
+            )
+            key_der = base64.b64decode(edge_manifest["key"])
+            derived_id = install.chromium_extension_id(key_der)
+            self.assertEqual(derived_id, summary["edge_extension_id"])
+
+            edge_native = json.loads(
+                (dest / "refineid_webeid_edge.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                edge_native["allowed_origins"],
+                [f"chrome-extension://{derived_id}/"],
+            )
+            self.assertEqual(edge_native["path"], str(dest / "host.cmd"))
+
+            firefox_manifest = json.loads(
+                (dest / "ext-firefox" / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(firefox_manifest["manifest_version"], 2)
+            self.assertEqual(
+                firefox_manifest["browser_specific_settings"]["gecko"]["id"],
+                install.FIREFOX_EXTENSION_ID,
+            )
+
+            firefox_native = json.loads(
+                (dest / "refineid_webeid_firefox.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                firefox_native["allowed_extensions"], [install.FIREFOX_EXTENSION_ID]
+            )
+
+    def test_install_posix_layout_without_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_so = tmp_path / "librefineid_pkcs11.so"
+            fake_so.write_bytes(b"\x7fELF")
+            dest = tmp_path / "out"
+
+            install.install(
+                source_dir=HERE,
+                dest=dest,
+                pkcs11_module=fake_so,
+                model="ESTeID",
+                register=False,
+                python_executable="/usr/bin/python3",
+                windows=False,
+            )
+            self.assertTrue((dest / "host.sh").is_file())
+            self.assertTrue(os.access(dest / "host.sh", os.X_OK))
+            self.assertTrue((dest / "ext-firefox" / "background.js").is_file())
+            self.assertTrue((dest / "ext-edge" / "content.js").is_file())
+
+
+    def test_install_windows_layout_with_non_ascii_python_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_dll = tmp_path / "refineid_pkcs11.dll"
+            fake_dll.write_bytes(b"MZ")
+            dest = tmp_path / "out"
+            py_path = r"C:\Users\Jürgen\Python315\python.exe"
+
+            install.install(
+                source_dir=HERE,
+                dest=dest,
+                pkcs11_module=fake_dll,
+                model="ESTeID",
+                register=False,
+                python_executable=py_path,
+                windows=True,
+            )
+            encoding = "mbcs" if install.IS_WINDOWS else "utf-8"
+            self.assertIn(py_path, (dest / "host.cmd").read_text(encoding=encoding))
+
+
+if __name__ == "__main__":
+    unittest.main()

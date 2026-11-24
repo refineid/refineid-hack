@@ -1,7 +1,0 @@
-{
-  "name": "refineid_webeid",
-  "description": "RefineID Web eID authentication host",
-  "path": "__ENTRY__",
-  "type": "stdio",
-  "allowed_extensions": ["refineid-webeid@refineid.fi"]
-}
