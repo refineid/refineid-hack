@@ -1,7 +1,7 @@
 # TARA login flow and token contract
 
 Observed on `www.eesti.ee` -> `tara.ria.ee` with an Estonian eID card,
-an ACS ACR39U reader and the RefineID module on FreeBSD. The provider in
+an ACS ACR39U reader and the RefineID PKCS#11 module. The provider in
 this directory is what answers the page.
 
 ## Flow
@@ -44,32 +44,36 @@ Timeouts: ack 1 s, native handshake 5 s, user interaction 120 s.
 - `algorithm`: `ES384`.
 - `signature`: base64 raw 96-byte ECDSA `r||s`.
 - Signed data: `SHA-384(origin) + SHA-384(challenge)`, signed as ES384
-  (the ECDSA operation hashes the 96-byte value again). Origin is
-  `https://tara.ria.ee`.
+  (the host hashes the 96-byte value with SHA-384 and passes the 48-byte
+  digest to `CKM_ECDSA`). Origin is `https://tara.ria.ee`.
 - `format`: `web-eid:1.0`.
 - `appVersion`: informative.
 
-The card signs with PIN1 and `CKM_ECDSA`; the OpenSSL pkcs11-provider
-returns DER, which the host converts to raw `r||s`.
+The card signs with PIN1 and `CKM_ECDSA` through the RefineID PKCS#11
+module, which returns the raw 96-byte `r||s` directly.
 
 ## Reproduce
 
-```
-./install.sh
+```sh
+python3 install.py --pkcs11 /path/to/refineid_pkcs11.dll
 ```
 
-Load `~/refineid-webeid/ext/manifest.json` from
-`about:debugging#/runtime/this-firefox`, open `www.eesti.ee`, choose
-self-service, keep the ID-card tab and press Continue.
+Load `ext-edge` in Edge (`edge://extensions` -> Load unpacked) or
+`ext-firefox/manifest.json` in Firefox (`about:debugging#/runtime/this-firefox`),
+open `www.eesti.ee`, choose self-service, keep the ID-card tab and press
+Continue.
 
 The host logs nothing, refuses origins other than `https://tara.ria.ee`,
-and refuses a PIN file readable by group or others.
+prompts locally for PIN1 in a masked dialog (zeroing its mutable PIN buffer
+right after `C_Login`), and on POSIX refuses any `REFINEID_WEBEID_PIN_FILE`
+readable by group or others.
 
 ## Evidence
 
-The token signature verified against the card certificate, and TARA
-returned the eesti.ee self-service dashboard. The page contract above is
-read from `/scripts/main.js`; a TARA change can move it.
+On FreeBSD 15.1 with an ACS ACR39U reader and Firefox 160, the token
+signature verified against the card certificate and TARA returned the
+eesti.ee self-service dashboard. The page contract above is read from
+`/scripts/main.js`; a TARA change can move it.
 
 Sources: TARA page and script, observed; Web eID authentication token
 format specification, <https://web-eid.github.io/web-eid-system-architecture-doc/>;

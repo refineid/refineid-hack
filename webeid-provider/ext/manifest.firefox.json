@@ -1,0 +1,23 @@
+{
+  "manifest_version": 2,
+  "name": "RefineID Web eID",
+  "version": "2.0.0",
+  "description": "Answers Web eID authentication requests with a RefineID PKCS#11 token.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "refineid-webeid@refineid.fi"
+    }
+  },
+  "permissions": ["nativeMessaging"],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://tara.ria.ee/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}
