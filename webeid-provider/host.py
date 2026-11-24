@@ -112,6 +112,63 @@ WIN_CANCELLED_STATUSES = frozenset(
     }
 )
 
+# Windows primary language identifiers (winnt.h LANG_*).
+WIN_PRIMARY_LANG_MASK = 0x03FF
+WIN_LANG_ENGLISH = 0x09
+WIN_LANG_FINNISH = 0x0B
+WIN_LANG_SWEDISH = 0x1D
+WIN_LANG_ESTONIAN = 0x25
+
+WIN_PRIMARY_LANG_MAP = {
+    WIN_LANG_ENGLISH: "en",
+    WIN_LANG_FINNISH: "fi",
+    WIN_LANG_SWEDISH: "sv",
+    WIN_LANG_ESTONIAN: "et",
+}
+
+LOCALIZED_STRINGS: dict[str, dict[str, str]] = {
+    "en": {
+        "use_context": "Authenticate to {origin}",
+        "cert_picker_title": "Web eID",
+        "cert_picker_prompt": "Select certificate to authenticate to {origin}",
+        "pin_prompt": "Enter PIN 1 to authenticate to:\n{origin}",
+        "pin_final_try": "Warning: final attempt before PIN 1 locks.",
+        "pin_count_low": "Note: previous PIN 1 attempt failed.",
+        "cancel": "Cancel",
+        "authenticate": "Authenticate",
+    },
+    "fi": {
+        "use_context": "Tunnistaudu palveluun {origin}",
+        "cert_picker_title": "Web eID",
+        "cert_picker_prompt": "Valitse varmenne palveluun {origin}",
+        "pin_prompt": "Anna PIN 1 tunnistautuaksesi palveluun:\n{origin}",
+        "pin_final_try": "Varoitus: viimeinen yritys ennen kuin PIN 1 lukittuu.",
+        "pin_count_low": "Huom: edellinen PIN 1 -yritys epäonnistui.",
+        "cancel": "Peruuta",
+        "authenticate": "Tunnistaudu",
+    },
+    "sv": {
+        "use_context": "Identifiera dig i tjänsten {origin}",
+        "cert_picker_title": "Web eID",
+        "cert_picker_prompt": "Välj certifikat för {origin}",
+        "pin_prompt": "Ange PIN 1 för att identifiera dig i:\n{origin}",
+        "pin_final_try": "Varning: sista försöket innan PIN 1 låses.",
+        "pin_count_low": "Obs: föregående PIN 1-försök misslyckades.",
+        "cancel": "Avbryt",
+        "authenticate": "Identifiera",
+    },
+    "et": {
+        "use_context": "Isikutuvastus teenuses {origin}",
+        "cert_picker_title": "Web eID",
+        "cert_picker_prompt": "Vali sertifikaat teenusesse {origin}",
+        "pin_prompt": "Isikutuvastuseks sisesta PIN 1:\n{origin}",
+        "pin_final_try": "Hoiatus: viimane katse enne PIN 1 lukustumist.",
+        "pin_count_low": "Märkus: eelmine PIN 1 katse ebaõnnestus.",
+        "cancel": "Loobu",
+        "authenticate": "Tuvasta",
+    },
+}
+
 # ---- PKCS#11 v2.40 constants (OASIS pkcs11t.h, used on POSIX) ----
 
 PKCS11_VERSION_MAJOR = 2
@@ -474,6 +531,61 @@ def compute_web_eid_tbs_hash(
     return hashlib.new(hash_name, origin_digest + challenge_digest).digest()
 
 
+def _normalize_lang_code(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower().replace("_", "-")
+    if not cleaned:
+        return None
+    primary = cleaned.split("-", 1)[0].split(".", 1)[0]
+    return primary if primary in LOCALIZED_STRINGS else None
+
+
+def detect_windows_ui_lang_id() -> int | None:
+    if not IS_WINDOWS:
+        return None
+    try:
+        return int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
+    except (AttributeError, OSError):
+        return None
+
+
+def resolve_ui_language(
+    requested_lang: Any = None,
+    *,
+    windows_lang_id: int | None = None,
+    env_locale: str | None = None,
+    windows: bool = IS_WINDOWS,
+) -> str:
+    """Select the UI language (fi, sv, et, en) matching the OS or page."""
+    req = _normalize_lang_code(requested_lang)
+    if windows:
+        lang_id = detect_windows_ui_lang_id() if windows_lang_id is None else windows_lang_id
+        if lang_id is not None:
+            mapped = WIN_PRIMARY_LANG_MAP.get(lang_id & WIN_PRIMARY_LANG_MASK)
+            if mapped is not None:
+                return mapped
+        return req or "en"
+    if req is not None:
+        return req
+    locale_str = (
+        env_locale
+        if env_locale is not None
+        else (
+            os.environ.get("LC_ALL")
+            or os.environ.get("LC_MESSAGES")
+            or os.environ.get("LANG")
+            or ""
+        )
+    )
+    return _normalize_lang_code(locale_str) or "en"
+
+
+def localized_text(lang: str, key: str, **kwargs: str) -> str:
+    table = LOCALIZED_STRINGS.get(lang, LOCALIZED_STRINGS["en"])
+    return table[key].format(**kwargs)
+
+
 def classify_windows_cng_status(status: int) -> HostError:
     """Map a Windows CNG SECURITY_STATUS code to a Web eID HostError."""
     code = status & WIN_STATUS_MASK
@@ -830,6 +942,7 @@ class WindowsCngProvider:
         candidates: list[tuple[Any, str, str, int | None, int]],
         origin: str,
         hwnd: ctypes.c_void_p,
+        lang: str,
     ) -> tuple[Any, str, str, int | None, int]:
         if len(candidates) == 1:
             return candidates[0]
@@ -846,8 +959,8 @@ class WindowsCngProvider:
             chosen = self._cryptui.CryptUIDlgSelectCertificateFromStore(
                 mem_store,
                 hwnd,
-                "Web eID",
-                f"Select certificate to authenticate to {origin}",
+                localized_text(lang, "cert_picker_title"),
+                localized_text(lang, "cert_picker_prompt", origin=origin),
                 0,
                 0,
                 None,
@@ -903,7 +1016,9 @@ class WindowsCngProvider:
                 self._crypt32.CertFreeCertificateContext(cert_ctx)
             self._crypt32.CertCloseStore(store, 0)
 
-    def authenticate(self, origin: str, challenge: str) -> tuple[bytes, str, bytes]:
+    def authenticate(
+        self, origin: str, challenge: str, lang: str = "en"
+    ) -> tuple[bytes, str, bytes]:
         """Sign Web eID challenge via Windows CNG with native Windows Security PIN UI."""
         store = self._crypt32.CertOpenStore(
             ctypes.c_void_p(CERT_STORE_PROV_SYSTEM_W),
@@ -924,7 +1039,7 @@ class WindowsCngProvider:
 
             hwnd = ctypes.c_void_p(self._user32.GetForegroundWindow() or 0)
             cert_ctx, web_alg, hash_name, ec_sig_bytes, _key_bits = (
-                self._select_candidate(candidates, origin, hwnd)
+                self._select_candidate(candidates, origin, hwnd, lang)
             )
             cert_der = ctypes.string_at(
                 cert_ctx.contents.pbCertEncoded, cert_ctx.contents.cbCertEncoded
@@ -951,7 +1066,9 @@ class WindowsCngProvider:
                     ctypes.sizeof(hwnd),
                     0,
                 )
-            ctx_buf = ctypes.create_unicode_buffer(f"Authenticate to {origin}")
+            ctx_buf = ctypes.create_unicode_buffer(
+                localized_text(lang, "use_context", origin=origin)
+            )
             self._ncrypt.NCryptSetProperty(
                 hkey, NCRYPT_PROP_USE_CONTEXT, ctx_buf, ctypes.sizeof(ctx_buf), 0
             )
@@ -1051,7 +1168,7 @@ def read_pin_file_posix(pin_file: str) -> bytearray:
         os.close(fd)
 
 
-def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
+def prompt_pin_dialog(origin: str, token_flags: int, lang: str = "en") -> bytearray:
     """Prompt the cardholder for PIN1 in a topmost masked GUI dialog (POSIX)."""
     try:
         import tkinter as tk
@@ -1068,11 +1185,11 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
     frame = tk.Frame(root, padx=18, pady=14)
     frame.pack(fill="both", expand=True)
 
-    prompt_text = f"Enter ID-card PIN1 to authenticate to:\n{origin}"
+    prompt_text = localized_text(lang, "pin_prompt", origin=origin)
     if token_flags & CKF_USER_PIN_FINAL_TRY:
-        prompt_text += "\n\nWarning: final attempt before PIN1 locks."
+        prompt_text += "\n\n" + localized_text(lang, "pin_final_try")
     elif token_flags & CKF_USER_PIN_COUNT_LOW:
-        prompt_text += "\n\nNote: previous PIN1 attempt failed."
+        prompt_text += "\n\n" + localized_text(lang, "pin_count_low")
 
     tk.Label(frame, text=prompt_text, justify="left").pack(anchor="w")
 
@@ -1095,12 +1212,15 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
         result["pin"] = bytearray(value.encode("utf-8"))
         root.destroy()
 
-    tk.Button(buttons, text="Cancel", width=10, command=on_cancel).pack(
-        side="right", padx=(8, 0)
-    )
-    tk.Button(buttons, text="Authenticate", width=12, command=on_submit).pack(
-        side="right"
-    )
+    tk.Button(
+        buttons, text=localized_text(lang, "cancel"), width=10, command=on_cancel
+    ).pack(side="right", padx=(8, 0))
+    tk.Button(
+        buttons,
+        text=localized_text(lang, "authenticate"),
+        width=12,
+        command=on_submit,
+    ).pack(side="right")
 
     root.protocol("WM_DELETE_WINDOW", on_cancel)
     root.bind("<Return>", on_submit)
@@ -1124,14 +1244,14 @@ def prompt_pin_dialog(origin: str, token_flags: int) -> bytearray:
     return pin
 
 
-def obtain_pin(origin: str, token_flags: int) -> bytearray | None:
+def obtain_pin(origin: str, token_flags: int, lang: str = "en") -> bytearray | None:
     """Obtain PIN1 bytes on POSIX, or None for a protected authentication path."""
     if token_flags & CKF_PROTECTED_AUTHENTICATION_PATH:
         return None
     pin_file = os.environ.get(ENV_PIN_FILE)
     if pin_file and not IS_WINDOWS:
         return read_pin_file_posix(pin_file)
-    return prompt_pin_dialog(origin, token_flags)
+    return prompt_pin_dialog(origin, token_flags, lang=lang)
 
 
 def _make_ulong_attr(attr_type: int, value: int) -> tuple[CkAttribute, CkUlong]:
@@ -1432,16 +1552,30 @@ def authenticate(
     if not isinstance(challenge, str) or len(challenge) < MIN_CHALLENGE_LENGTH:
         raise HostError("challenge nonce is missing", code=ERROR_CODE_INVALID_ARGUMENT)
 
+    ui_lang = resolve_ui_language(
+        arguments.get("lang"), windows=use_windows_cng
+    )
+
     if use_windows_cng:
         provider = (cng_factory or WindowsCngProvider)()
-        cert_der, algorithm, signature = provider.authenticate(origin, challenge)
+        cert_der, algorithm, signature = provider.authenticate(
+            origin, challenge, lang=ui_lang
+        )
     else:
         module_path = resolve_pkcs11_path(cfg)
         model = resolve_model(cfg)
         tbs_hash = compute_web_eid_tbs_hash(origin, challenge)
         provider = pkcs11_factory(module_path)
+
+        def localized_pin_getter(
+            req_origin: str, flags: int
+        ) -> bytearray | None:
+            if pin_getter is obtain_pin:
+                return obtain_pin(req_origin, flags, lang=ui_lang)
+            return pin_getter(req_origin, flags)
+
         cert_der, signature = provider.sign_authentication(
-            model, origin, tbs_hash, pin_getter
+            model, origin, tbs_hash, localized_pin_getter
         )
         algorithm = ALGORITHM_ES384
 

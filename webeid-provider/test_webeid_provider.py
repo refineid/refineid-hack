@@ -26,6 +26,10 @@ SYNTHETIC_CHALLENGE = "A" * 44
 SYNTHETIC_CERT_DER = b"\x30\x82\x01\x00" + (b"\x11" * 16)
 SYNTHETIC_SIGNATURE = bytes(range(host.EC_P384_SIG_BYTES))
 SYNTHETIC_PIN = b"1234"
+LCID_FI_FI = 0x040B
+LCID_ET_EE = 0x0425
+LCID_SV_SE = 0x041D
+LCID_DE_DE = 0x0407
 
 
 class FakePkcs11Provider:
@@ -71,10 +75,12 @@ class FakeCngProvider:
         self.algorithm = algorithm
         self.signature = signature
         self.error = error
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, str]] = []
 
-    def authenticate(self, origin: str, challenge: str) -> tuple[bytes, str, bytes]:
-        self.calls.append((origin, challenge))
+    def authenticate(
+        self, origin: str, challenge: str, lang: str = "en"
+    ) -> tuple[bytes, str, bytes]:
+        self.calls.append((origin, challenge, lang))
         if self.error is not None:
             raise self.error
         return self.cert_der, self.algorithm, self.signature
@@ -193,7 +199,42 @@ class HostProtocolTests(unittest.TestCase):
             base64.b64decode(reply["unverifiedCertificate"]), SYNTHETIC_CERT_DER
         )
         self.assertEqual(base64.b64decode(reply["signature"]), SYNTHETIC_SIGNATURE)
-        self.assertEqual(fake.calls, [("https://tara.ria.ee", SYNTHETIC_CHALLENGE)])
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0][:2], ("https://tara.ria.ee", SYNTHETIC_CHALLENGE))
+        self.assertIn(fake.calls[0][2], host.LOCALIZED_STRINGS)
+
+    def test_resolve_ui_language_and_localizations(self) -> None:
+        self.assertEqual(
+            host.resolve_ui_language("en", windows_lang_id=LCID_FI_FI, windows=True),
+            "fi",
+        )
+        self.assertEqual(
+            host.resolve_ui_language("en", windows_lang_id=LCID_ET_EE, windows=True),
+            "et",
+        )
+        self.assertEqual(
+            host.resolve_ui_language("en", windows_lang_id=LCID_SV_SE, windows=True),
+            "sv",
+        )
+        self.assertEqual(
+            host.resolve_ui_language("et", windows_lang_id=LCID_DE_DE, windows=True),
+            "et",
+        )
+        self.assertEqual(
+            host.resolve_ui_language("et", env_locale="fi_FI.UTF-8", windows=False),
+            "et",
+        )
+        self.assertEqual(
+            host.resolve_ui_language(None, env_locale="fi_FI.UTF-8", windows=False),
+            "fi",
+        )
+        for lang in ("en", "fi", "sv", "et"):
+            text = host.localized_text(lang, "use_context", origin="https://tara.ria.ee")
+            self.assertIn("https://tara.ria.ee", text)
+            pin_text = host.localized_text(
+                lang, "pin_prompt", origin="https://tara.ria.ee"
+            )
+            self.assertIn("PIN 1", pin_text)
 
     def test_windows_cng_cancel_propagates_user_cancelled(self) -> None:
         fake = FakeCngProvider(

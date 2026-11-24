@@ -26,7 +26,8 @@ recorded in [TARA-LOGIN.md](TARA-LOGIN.md).
    `{"command": "authenticate", "arguments": {"challengeNonce", "origin"}}`.
    - On Windows, `host.py` selects the live `ClientAuth` certificate from
      `CurrentUser\MY` under `Microsoft Smart Card Key Storage Provider`, sets
-     `NCRYPT_USE_CONTEXT_PROPERTY` to `Authenticate to <origin>`, computes
+     `NCRYPT_USE_CONTEXT_PROPERTY` localized to the Windows UI language
+     (Finnish, Swedish, Estonian, English), computes
      `H(H(origin) || H(challengeNonce))`, and calls `NCryptSignHash` — Windows
      prompts natively for PIN1 and returns the signature (`ES384`/`ES256`/`RS256`).
    - On POSIX, `host.py` loads the RefineID PKCS#11 module, selects `ESTeID`,
