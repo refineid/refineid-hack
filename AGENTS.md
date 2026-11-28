@@ -89,15 +89,62 @@ apply. See "Rules of this repository" in the README.
 
 ## Independent review
 
-- Review is optional here: the agent decides whether a change needs one, for
-  example code that parses what a card, a network or a radio sends.
-- A review uses a model from a different family than the one that wrote the
-  change: the `agy` CLI with `gemini-3.8-flash-high`, or a free OpenCode model
-  (`opencode models | grep ^opencode`; deepseek and glm are usually good, and
-  another one can be too).
-- Run it headless and read-only from an empty directory, with the diff in the
-  prompt and no tool use, framed as a code review from the project's author:
-  `agy --sandbox --mode plan --model gemini-3.8-flash-high -p "$prompt"` or
-  `opencode run --archived --agent plan -m opencode/<model> "$prompt"`.
+- Review is optional here: the agent decides whether a change needs
+  one, for example code that parses what a card, a network, or a radio
+  sends. Once a review is required, use a premier frontier model from
+  a family distinct from every family that authored any part of the
+  diff; deep reviews -- protocol, cryptography, concurrency,
+  state-machine, security-critical, signing, or shared cross-platform
+  contract changes (and any change whose tier is unclear) -- require
+  at least two reviewers from distinct non-author families, running
+  all available eligible premier families in parallel.
+- Premier reviewers (as of 2026-11; pick families distinct from every
+  authoring family at the strongest available reasoning tier):
+  - **Anthropic**: `agy` with `claude-opus-5-5-high`
+    (Claude Opus 5.5 / High).
+  - **Google**: `agy` with `gemini-4-carbon-high` (or
+    `gemini-4-neon-xhigh` / `gemini-4-neon-high` if ranked higher).
+  - **OpenAI**: `codex exec` with `--model gpt-6.2-astra
+    -c model_reasoning_effort=xhigh` (GPT-6.2-Astra / xhigh;
+    maintainer-authorized for this project when installed and within
+    quota).
+- Frontier rankings and CLI catalogs evolve over time; agents may
+  check <https://artificialanalysis.ai> alongside each CLI's model
+  list (for example `agy models` or Codex's available models) to pick
+  the strongest currently available frontier model per family instead
+  of using weaker reviewers while premier models are available.
+- Filter candidates first by family independence, authorization, and
+  availability, and fill required slots from eligible premier families
+  first. Use fallback harnesses -- `claude`, `opencode`, or `muse` --
+  only per unfilled required slot when no eligible premier family
+  remains available due to missing CLI, authorization, quota, outage,
+  or same-family exclusion, selecting the strongest listed model whose
+  training organization differs from every authoring family and from
+  every reviewer family already counted for the diff. If a change
+  needs review and the required independent reviewers cannot be
+  obtained, stop and report to the owner instead of merging unreviewed.
+- A model family is the organization that trained the model (human-only
+  authorship excludes no family). When a reviewer's family is
+  uncertain, treat it as same-family and skip it; if an AI author's
+  family is uncertain, ask the owner.
+- Run every reviewer headless from an empty scratch directory,
+  supplying the diff in the prompt (reading any prompt file into a
+  variable or stream and checking that the read succeeded before
+  launching) and explicitly instructing it not to use any tools. Use
+  each CLI's strictest read-only sandbox and plan/no-edit mode -- for
+  example, on POSIX shells `command agy --sandbox --mode plan
+  --disable-slash-commands --model <model> -p "$prompt"` and
+  `command codex exec --ignore-user-config --model gpt-6.2-astra
+  -c model_reasoning_effort=xhigh --ephemeral --skip-git-repo-check
+  --sandbox read-only --json -o OUT_FILE - < PROMPT_FILE`; on Windows
+  PowerShell resolve executables directly via `& (Get-Command agy
+  -CommandType Application)` with `-p (Get-Content -Raw -ErrorAction
+  Stop PROMPT_FILE)` or pipe `Get-Content -Raw -ErrorAction Stop
+  PROMPT_FILE | & (Get-Command codex -CommandType Application) exec
+  ... -`. Always bypass shell aliases or functions that add
+  `--dangerously-skip-permissions`,
+  `--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, or
+  `--yolo`, never grant write or auto-approval permissions, and frame
+  the request as a code review from the project's author.
 - Check every finding against the code. Fix the real ones and list the
   rejected ones, with the reason, in the pull request description.
